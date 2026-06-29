@@ -1,0 +1,10 @@
+[package]
+name = "sudoku-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sudoku grid types and backtracking solver"
+
+[dependencies]

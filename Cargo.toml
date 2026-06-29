@@ -1,7 +1,20 @@
-[package]
-name = "sudoku-solver"
-version = "0.1.0"
-authors = ["sn99 <siddharthn.099@gmail.com>"]
-edition = "2018"
+[workspace]
+resolver = "2"
+members = [
+    "crates/sudoku-core",
+    "crates/sudoku-ocr",
+    "crates/sudoku-cli",
+    "crates/sudoku-wasm",
+]
+default-members = ["crates/sudoku-cli"]
 
-[dependencies]
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+authors = ["sn99 <siddharthn.099@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/sn99/sudoku-solver"
+
+[workspace.dependencies]
+sudoku-core = { path = "crates/sudoku-core" }
+sudoku-ocr = { path = "crates/sudoku-ocr" }

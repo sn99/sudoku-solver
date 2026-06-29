@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f172a" />
+  <title>Sudoku Solver — Scan &amp; Solve</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <main class="app">
+    <header>
+      <h1>Sudoku Solver</h1>
+      <p class="tagline">Scan with your camera or upload a photo. Edit low-confidence cells, then solve — solver runs in <strong>Rust (WASM)</strong>.</p>
+    </header>
+
+    <section class="capture" id="capture-section">
+      <div class="video-wrap">
+        <video id="video" playsinline autoplay muted></video>
+        <div class="frame-guide" aria-hidden="true"></div>
+        <canvas id="snap-canvas" class="hidden"></canvas>
+      </div>
+      <div class="actions">
+        <button type="button" id="btn-camera" class="primary">Open camera</button>
+        <button type="button" id="btn-snap" class="primary" disabled>Capture</button>
+        <label class="button secondary file-label">
+          Upload photo
+          <input type="file" id="file-input" accept="image/*" capture="environment" hidden />
+        </label>
+      </div>
+      <p id="status" class="status" role="status"></p>
+    </section>
+
+    <section class="board-section hidden" id="board-section">
+      <p class="hint">Tap a cell to edit. <span class="low-conf-swatch"></span> = low OCR confidence — double-check these.</p>
+      <div id="board" class="board" aria-label="Sudoku grid"></div>
+      <div class="actions">
+        <button type="button" id="btn-solve" class="primary">Solve</button>
+        <button type="button" id="btn-clear" class="secondary">Clear</button>
+        <button type="button" id="btn-rescan" class="secondary">New scan</button>
+      </div>
+      <p id="solve-status" class="status" role="status"></p>
+    </section>
+
+    <footer>
+      <p>
+        Native CLI OCR uses <a href="https://github.com/thomasgruebl/rusty-tesseract">rusty-tesseract</a>.
+        Browser OCR uses Tesseract.js (same cell + confidence model).
+        <a href="https://github.com/sn99/sudoku-solver">Source</a>
+      </p>
+    </footer>
+  </main>
+
+  <!-- Tesseract.js from CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

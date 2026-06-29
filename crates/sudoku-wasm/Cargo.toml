@@ -1,0 +1,19 @@
+[package]
+name = "sudoku-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WASM bindings for sudoku-core (solve in the browser)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sudoku-core = { workspace = true }
+wasm-bindgen = "0.2"
+console_error_panic_hook = { version = "0.1", optional = true }
+
+[features]
+default = ["console_error_panic_hook"]
