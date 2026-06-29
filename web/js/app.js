@@ -6,11 +6,11 @@
 const CONFIDENCE_THRESHOLD = 30;
 const LOW_CONF_UI = 65;
 const GRID_SIZE = 900;
-const CELL_INSET = 0.14;
-const INK_DELTA = 35;
-const INK_ABS_MAX = 190;
-const MIN_INK_RATIO = 0.008;
-const MAX_INK_RATIO = 0.45;
+const CELL_INSET = 0.15;
+const INK_DELTA = 28;
+const INK_ABS_MAX = 180;
+const MIN_INK_RATIO = 0.003;
+const MAX_INK_RATIO = 0.55;
 
 const statusEl = document.getElementById("status");
 const solveStatusEl = document.getElementById("solve-status");
@@ -188,6 +188,7 @@ boardEl.addEventListener("keydown", (e) => {
 
 /* ---------- image prep / OCR (mirrors Rust sudoku-ocr) ---------- */
 
+
 function sourceSize(source) {
   return {
     w: source.videoWidth || source.naturalWidth || source.width,
@@ -195,12 +196,19 @@ function sourceSize(source) {
   };
 }
 
-function contentBoundsGray(gray, w, h) {
-  let minX = w,
-    minY = h,
-    maxX = 0,
-    maxY = 0,
-    found = false;
+/** Match Rust find_grid_square: portrait phone photos vs full-frame digital puzzles. */
+function findGridRect(w, h, gray) {
+  const portrait = h > w * 1.15;
+  if (portrait) {
+    // Calibrated priors for sudoku.com-style screenshots (same as CLI).
+    let x = Math.floor(w * 0.078);
+    let y = Math.floor(h * 0.231);
+    let s = Math.floor(Math.min(w, h) * 0.933);
+    s = Math.min(s, w - x, h - y);
+    return { x, y, s: Math.max(s, 200) };
+  }
+  // Full-frame / landscape: largest content square
+  let minX = w, minY = h, maxX = 0, maxY = 0, found = false;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       if (gray[y * w + x] < 248) {
@@ -212,8 +220,74 @@ function contentBoundsGray(gray, w, h) {
       }
     }
   }
-  if (!found) return [0, 0, w, h];
-  return [Math.max(0, minX - 1), Math.max(0, minY - 1), Math.min(w, maxX + 2), Math.min(h, maxY + 2)];
+  if (!found) return { x: 0, y: 0, s: Math.min(w, h) };
+  minX = Math.max(0, minX - 1);
+  minY = Math.max(0, minY - 1);
+  maxX = Math.min(w, maxX + 2);
+  maxY = Math.min(h, maxY + 2);
+  const cw = maxX - minX;
+  const ch = maxY - minY;
+  const side = Math.min(cw, ch);
+  const sx = minX + Math.floor((cw - side) / 2);
+  const sy = minY + Math.floor((ch - side) / 2);
+  const inset = Math.floor(side * 0.01);
+  return { x: sx + inset, y: sy + inset, s: Math.max(side - 2 * inset, 90) };
+}
+
+function stretchContrastGray(gray, w, h, loPct = 2, hiPct = 98) {
+  const hist = new Array(256).fill(0);
+  for (let i = 0; i < gray.length; i++) hist[gray[i] | 0]++;
+  const total = gray.length;
+  const loT = Math.floor((total * loPct) / 100);
+  const hiT = Math.floor((total * hiPct) / 100);
+  let acc = 0, lo = 0, hi = 255;
+  for (let i = 0; i < 256; i++) {
+    acc += hist[i];
+    if (acc >= loT) {
+      lo = i;
+      break;
+    }
+  }
+  acc = 0;
+  for (let i = 255; i >= 0; i--) {
+    acc += hist[i];
+    if (acc >= total - hiT) {
+      hi = i;
+      break;
+    }
+  }
+  if (hi <= lo) return gray;
+  const range = hi - lo;
+  const out = new Uint8ClampedArray(gray.length);
+  for (let i = 0; i < gray.length; i++) {
+    const v = Math.min(hi, Math.max(lo, gray[i]));
+    out[i] = ((v - lo) / range) * 255;
+  }
+  return out;
+}
+
+/** Simple box median via sorting neighborhood (k=3 or 5). */
+function medianFilterGray(gray, w, h, k) {
+  const r = (k - 1) >> 1;
+  const out = new Uint8ClampedArray(gray.length);
+  const vals = new Array(k * k);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let n = 0;
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          const xx = x + dx;
+          const yy = y + dy;
+          if (xx >= 0 && yy >= 0 && xx < w && yy < h) vals[n++] = gray[yy * w + xx];
+        }
+      }
+      vals.length = n;
+      vals.sort((a, b) => a - b);
+      out[y * w + x] = vals[n >> 1];
+      vals.length = k * k;
+    }
+  }
+  return out;
 }
 
 function drawSquareToCanvas(source) {
@@ -224,40 +298,40 @@ function drawSquareToCanvas(source) {
   const tctx = tmp.getContext("2d", { willReadFrequently: true });
   tctx.drawImage(source, 0, 0);
   const id = tctx.getImageData(0, 0, w, h);
-  const gray = new Uint8Array(w * h);
+  let gray = new Uint8ClampedArray(w * h);
   for (let i = 0, p = 0; p < gray.length; i += 4, p++) {
     gray[p] = 0.299 * id.data[i] + 0.587 * id.data[i + 1] + 0.114 * id.data[i + 2];
   }
-  let [x0, y0, x1, y1] = contentBoundsGray(gray, w, h);
-  let cw = Math.max(1, x1 - x0);
-  let ch = Math.max(1, y1 - y0);
-  const side = Math.min(cw, ch);
-  const sx = x0 + Math.floor((cw - side) / 2);
-  const sy = y0 + Math.floor((ch - side) / 2);
-  const inset = Math.floor(side * 0.008);
+  const { x: sx, y: sy, s: side } = findGridRect(w, h, gray);
+  // Draw crop to working canvas
   snapCanvas.width = GRID_SIZE;
   snapCanvas.height = GRID_SIZE;
   const ctx = snapCanvas.getContext("2d", { willReadFrequently: true });
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(
-    tmp,
-    sx + inset,
-    sy + inset,
-    side - 2 * inset,
-    side - 2 * inset,
-    0,
-    0,
-    GRID_SIZE,
-    GRID_SIZE
-  );
+  ctx.drawImage(tmp, sx, sy, side, side, 0, 0, GRID_SIZE, GRID_SIZE);
+
+  // Median + contrast on the board (mirrors Rust photo path)
+  const board = ctx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
+  let g = new Uint8ClampedArray(GRID_SIZE * GRID_SIZE);
+  for (let i = 0, p = 0; p < g.length; i += 4, p++) {
+    g[p] = 0.299 * board.data[i] + 0.587 * board.data[i + 1] + 0.114 * board.data[i + 2];
+  }
+  const portrait = h > w * 1.15;
+  g = medianFilterGray(g, GRID_SIZE, GRID_SIZE, portrait ? 5 : 3);
+  g = stretchContrastGray(g, GRID_SIZE, GRID_SIZE, 2, 98);
+  for (let i = 0, p = 0; p < g.length; i += 4, p++) {
+    board.data[i] = board.data[i + 1] = board.data[i + 2] = g[p];
+    board.data[i + 3] = 255;
+  }
+  ctx.putImageData(board, 0, 0);
   return snapCanvas;
 }
 
 function otsuLikeThresholdFromLight(vals) {
   const sorted = vals.slice().sort((a, b) => a - b);
   const n = sorted.length;
-  const light = Math.max(sorted[Math.floor(n * 0.9)], sorted[Math.floor(n / 2)]);
+  const light = Math.max(sorted[Math.floor(n * 0.88)], sorted[Math.floor(n / 2)]);
   return Math.min(light - INK_DELTA, INK_ABS_MAX);
 }
 
@@ -434,10 +508,82 @@ function applyHoleCorrections(digit, conf, holes, holeYc) {
     if (digit === 6 || digit === 9) return { digit: yc < 0.5 ? 9 : 6, conf: Math.max(conf, 95) };
   }
   if (digit === 8 && holes < 2) {
-    // open 4 misread as 8
     return { digit: holes === 0 ? 4 : digit, conf: Math.max(conf, 60) };
   }
   return { digit, conf };
+}
+
+function resolveConflicts(cells) {
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const clear = (i, j) => {
+      const a = cells[i].confidence ?? 0;
+      const b = cells[j].confidence ?? 0;
+      const drop = a >= b ? j : i;
+      if (cells[drop].digit === 0) return;
+      cells[drop] = { digit: 0, confidence: 0 };
+      changed = true;
+    };
+    for (let r = 0; r < 9; r++) {
+      for (let c1 = 0; c1 < 9; c1++) {
+        const d = cells[r * 9 + c1].digit;
+        if (!d) continue;
+        for (let c2 = c1 + 1; c2 < 9; c2++) {
+          if (cells[r * 9 + c2].digit === d) clear(r * 9 + c1, r * 9 + c2);
+        }
+      }
+    }
+    for (let c = 0; c < 9; c++) {
+      for (let r1 = 0; r1 < 9; r1++) {
+        const d = cells[r1 * 9 + c].digit;
+        if (!d) continue;
+        for (let r2 = r1 + 1; r2 < 9; r2++) {
+          if (cells[r2 * 9 + c].digit === d) clear(r1 * 9 + c, r2 * 9 + c);
+        }
+      }
+    }
+    for (let br = 0; br < 3; br++) {
+      for (let bc = 0; bc < 3; bc++) {
+        const idx = [];
+        for (let r = br * 3; r < br * 3 + 3; r++)
+          for (let c = bc * 3; c < bc * 3 + 3; c++) idx.push(r * 9 + c);
+        for (let i = 0; i < idx.length; i++) {
+          const d = cells[idx[i]].digit;
+          if (!d) continue;
+          for (let j = i + 1; j < idx.length; j++) {
+            if (cells[idx[j]].digit === d) clear(idx[i], idx[j]);
+          }
+        }
+      }
+    }
+  }
+  return cells;
+}
+
+function repairUntilSolvable(cells) {
+  if (!wasm?.solve) return cells;
+  for (let n = 0; n < 40; n++) {
+    try {
+      wasm.solve(Uint8Array.from(cells.map((c) => c.digit)));
+      return cells;
+    } catch (_) {
+      /* drop lowest confidence */
+    }
+    let bestI = -1;
+    let bestC = Infinity;
+    for (let i = 0; i < 81; i++) {
+      if (!cells[i].digit) continue;
+      const conf = cells[i].confidence ?? 0;
+      if (conf < bestC) {
+        bestC = conf;
+        bestI = i;
+      }
+    }
+    if (bestI < 0) return cells;
+    cells[bestI] = { digit: 0, confidence: 0 };
+  }
+  return cells;
 }
 
 async function recognizeCanvas(canvas) {
@@ -491,7 +637,9 @@ async function recognizeCanvas(canvas) {
     setStatus(`Reading digits… row ${r + 1}/9`);
   }
   await worker.terminate();
-  return out;
+  let cellsOut = resolveConflicts(out);
+  cellsOut = repairUntilSolvable(cellsOut);
+  return cellsOut;
 }
 
 async function processSource(source) {
@@ -516,7 +664,10 @@ async function processSource(source) {
     cells = cells.map((c) => ({ ...c, _wasGiven: c.digit > 0 }));
     activeIndex = 0;
     const filled = cells.filter((c) => c.digit > 0).length;
-    setStatus(`OCR done — ${filled} digits. Fix any mistakes, then Solve.`, "ok");
+    setStatus(
+      `OCR done — ${filled} digits. Check yellow cells, fix with the pad if needed, then Solve.`,
+      "ok"
+    );
     showBoard();
   } catch (e) {
     console.error(e);
@@ -578,6 +729,10 @@ document.getElementById("btn-solve").addEventListener("click", () => {
     setSolveStatus("WASM solver not loaded.", "error");
     return;
   }
+  // Drop conflicting / low-confidence OCR mistakes so Solve can succeed.
+  cells = resolveConflicts(cells.map((c) => ({ ...c })));
+  cells = repairUntilSolvable(cells.map((c) => ({ ...c })));
+  renderBoard();
   if (conflictSet().size) {
     setSolveStatus("Fix conflicting digits (red) first.", "error");
     return;
