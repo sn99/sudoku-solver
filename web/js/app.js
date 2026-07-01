@@ -1,16 +1,19 @@
 /**
- * Sudoku scan UI — adaptive per-cell binarization + multi-pass Tesseract.js
- * + hole-based 6/8/9 corrections (mirrors crates/sudoku-ocr).
+ * Sudoku scan UI — fast grid crop + parallel Tesseract.js (scheduler) + hole fixes.
  */
 
 const CONFIDENCE_THRESHOLD = 30;
 const LOW_CONF_UI = 65;
-const GRID_SIZE = 900;
+/** Board working resolution — 540 is enough for digit OCR and much faster than 900. */
+const GRID_SIZE = 540;
 const CELL_INSET = 0.15;
 const INK_DELTA = 28;
 const INK_ABS_MAX = 180;
 const MIN_INK_RATIO = 0.003;
 const MAX_INK_RATIO = 0.55;
+const OCR_DIGIT_SIZE = 56;
+const OCR_PAD = 10;
+const OCR_WORKERS = Math.min(4, Math.max(2, (navigator.hardwareConcurrency || 4) >> 1));
 
 const statusEl = document.getElementById("status");
 const solveStatusEl = document.getElementById("solve-status");
@@ -26,6 +29,9 @@ let wasm = null;
 let cells = emptyCells();
 let solutionMode = false;
 let activeIndex = 0;
+/** @type {import('tesseract.js').Scheduler | null} */
+let ocrScheduler = null;
+let ocrWarmPromise = null;
 
 function emptyCells() {
   return Array.from({ length: 81 }, () => ({ digit: 0, confidence: -1 }));
@@ -388,61 +394,95 @@ function stretchContrastGray(gray, w, h, loPct = 2, hiPct = 98) {
   return out;
 }
 
-/** Simple box median via sorting neighborhood (k=3 or 5). */
-function medianFilterGray(gray, w, h, k) {
-  const r = (k - 1) >> 1;
-  const out = new Uint8ClampedArray(gray.length);
-  const vals = new Array(k * k);
+/** Fast separable box blur (denoise without O(n·k² log) median sorts). */
+function boxBlurGray(gray, w, h, radius) {
+  const tmp = new Float32Array(w * h);
+  const out = new Uint8ClampedArray(w * h);
+  const r = radius | 0;
   for (let y = 0; y < h; y++) {
+    let sum = 0;
+    let n = 0;
+    for (let x = 0; x <= Math.min(w - 1, r); x++) {
+      sum += gray[y * w + x];
+      n++;
+    }
     for (let x = 0; x < w; x++) {
-      let n = 0;
-      for (let dy = -r; dy <= r; dy++) {
-        for (let dx = -r; dx <= r; dx++) {
-          const xx = x + dx;
-          const yy = y + dy;
-          if (xx >= 0 && yy >= 0 && xx < w && yy < h) vals[n++] = gray[yy * w + xx];
-        }
+      tmp[y * w + x] = sum / n;
+      const add = x + r + 1;
+      const rem = x - r;
+      if (add < w) {
+        sum += gray[y * w + add];
+        n++;
       }
-      vals.length = n;
-      vals.sort((a, b) => a - b);
-      out[y * w + x] = vals[n >> 1];
-      vals.length = k * k;
+      if (rem >= 0) {
+        sum -= gray[y * w + rem];
+        n--;
+      }
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let sum = 0;
+    let n = 0;
+    for (let y = 0; y <= Math.min(h - 1, r); y++) {
+      sum += tmp[y * w + x];
+      n++;
+    }
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = sum / n;
+      const add = y + r + 1;
+      const rem = y - r;
+      if (add < h) {
+        sum += tmp[add * w + x];
+        n++;
+      }
+      if (rem >= 0) {
+        sum -= tmp[rem * w + x];
+        n--;
+      }
     }
   }
   return out;
 }
 
 function drawSquareToCanvas(source) {
-  const { w, h } = sourceSize(source);
+  const { w: sw, h: sh } = sourceSize(source);
+  // Downscale huge phone photos before grid search (biggest win for line-peak scan).
+  const maxDetect = 720;
+  const detScale = Math.min(1, maxDetect / Math.max(sw, sh));
+  const dw = Math.max(1, Math.round(sw * detScale));
+  const dh = Math.max(1, Math.round(sh * detScale));
   const tmp = document.createElement("canvas");
-  tmp.width = w;
-  tmp.height = h;
+  tmp.width = dw;
+  tmp.height = dh;
   const tctx = tmp.getContext("2d", { willReadFrequently: true });
-  tctx.drawImage(source, 0, 0);
-  const id = tctx.getImageData(0, 0, w, h);
-  let gray = new Uint8ClampedArray(w * h);
+  tctx.drawImage(source, 0, 0, dw, dh);
+  const id = tctx.getImageData(0, 0, dw, dh);
+  const gray = new Uint8ClampedArray(dw * dh);
   for (let i = 0, p = 0; p < gray.length; i += 4, p++) {
     gray[p] = 0.299 * id.data[i] + 0.587 * id.data[i + 1] + 0.114 * id.data[i + 2];
   }
-  const { x: sx, y: sy, s: side } = findGridRect(w, h, gray);
-  // Draw crop to working canvas
+  let { x: sx, y: sy, s: side } = findGridRect(dw, dh, gray);
+  // Map rect back to full-res source for a sharper board crop.
+  const inv = 1 / detScale;
+  const fx = Math.floor(sx * inv);
+  const fy = Math.floor(sy * inv);
+  const fs = Math.min(Math.ceil(side * inv), sw - fx, sh - fy);
+
   snapCanvas.width = GRID_SIZE;
   snapCanvas.height = GRID_SIZE;
   const ctx = snapCanvas.getContext("2d", { willReadFrequently: true });
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(tmp, sx, sy, side, side, 0, 0, GRID_SIZE, GRID_SIZE);
+  ctx.drawImage(source, fx, fy, fs, fs, 0, 0, GRID_SIZE, GRID_SIZE);
 
-  // Median + contrast on the board (mirrors Rust photo path)
   const board = ctx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
   let g = new Uint8ClampedArray(GRID_SIZE * GRID_SIZE);
   for (let i = 0, p = 0; p < g.length; i += 4, p++) {
     g[p] = 0.299 * board.data[i] + 0.587 * board.data[i + 1] + 0.114 * board.data[i + 2];
   }
-  // Stronger denoise on noisy / moiré phone photos (mirrors Rust estimate_noise).
   let noiseAcc = 0,
     noiseN = 0;
-  const nstep = Math.max(2, Math.floor(GRID_SIZE / 100));
+  const nstep = Math.max(2, Math.floor(GRID_SIZE / 80));
   for (let y = 1; y < GRID_SIZE - 1; y += nstep) {
     for (let x = 1; x < GRID_SIZE - 1; x += nstep) {
       const v = g[y * GRID_SIZE + x];
@@ -451,7 +491,7 @@ function drawSquareToCanvas(source) {
     }
   }
   const noisy = noiseAcc / Math.max(1, noiseN) > 12;
-  g = medianFilterGray(g, GRID_SIZE, GRID_SIZE, noisy ? 5 : 3);
+  g = boxBlurGray(g, GRID_SIZE, GRID_SIZE, noisy ? 2 : 1);
   g = stretchContrastGray(g, GRID_SIZE, GRID_SIZE, 2, 98);
   for (let i = 0, p = 0; p < g.length; i += 4, p++) {
     board.data[i] = board.data[i + 1] = board.data[i + 2] = g[p];
@@ -737,59 +777,106 @@ function repairUntilSolvable(cells) {
   return cells;
 }
 
+async function ensureOcrScheduler() {
+  if (ocrScheduler) return ocrScheduler;
+  if (ocrWarmPromise) return ocrWarmPromise;
+  ocrWarmPromise = (async () => {
+    setStatus(`Starting OCR (${OCR_WORKERS} workers)…`);
+    const scheduler = Tesseract.createScheduler();
+    const workers = await Promise.all(
+      Array.from({ length: OCR_WORKERS }, async () => {
+        const w = await Tesseract.createWorker("eng", 1, { logger: () => {} });
+        await w.setParameters({
+          tessedit_char_whitelist: "123456789",
+          tessedit_pageseg_mode: "10",
+          classify_bln_numeric_mode: "1",
+        });
+        return w;
+      })
+    );
+    for (const w of workers) scheduler.addWorker(w);
+    ocrScheduler = scheduler;
+    return scheduler;
+  })();
+  try {
+    return await ocrWarmPromise;
+  } catch (e) {
+    ocrWarmPromise = null;
+    throw e;
+  }
+}
+
+/** Recognize one digit image; one fast PSM-10 pass, optional PSM-8 only if needed. */
+async function recognizeDigitJob(scheduler, dataUrl) {
+  let {
+    data: { text, confidence },
+  } = await scheduler.addJob("recognize", dataUrl);
+  let digit = parseDigit(text);
+  let conf = confidence || 0;
+  if (digit === 0 || conf < FAST_OCR_CONF) {
+    // Second pass only for uncertain cells (much faster than always doing 3 PSMs).
+    const retry = await scheduler.addJob("recognize", dataUrl, {
+      tessedit_pageseg_mode: "8",
+    });
+    const d2 = parseDigit(retry.data.text);
+    const c2 = retry.data.confidence || 0;
+    if (d2 > 0 && (digit === 0 || c2 > conf)) {
+      digit = d2;
+      conf = c2;
+    }
+  }
+  return { digit, conf };
+}
+
 async function recognizeCanvas(canvas) {
-  setStatus("Loading OCR…");
-  const worker = await Tesseract.createWorker("eng", 1, { logger: () => {} });
+  const t0 = performance.now();
+  const scheduler = await ensureOcrScheduler();
   const cell = GRID_SIZE / 9;
-  const out = [];
+  const out = Array.from({ length: 81 }, () => ({ digit: 0, confidence: 100 }));
+  const jobs = [];
+
   for (let r = 0; r < 9; r++) {
     for (let c = 0; c < 9; c++) {
+      const i = r * 9 + c;
       const { canvas: bin, inkRatio } = cellToBinary(canvas, c * cell, r * cell, cell);
       if (inkRatio < MIN_INK_RATIO) {
-        out.push({ digit: 0, confidence: 100 });
+        out[i] = { digit: 0, confidence: 100 };
         continue;
       }
       if (inkRatio > MAX_INK_RATIO) {
-        out.push({ digit: 0, confidence: 15 });
+        out[i] = { digit: 0, confidence: 15 };
         continue;
       }
-
-      const padded = padWhite(bin, 24, 120);
-      const candidates = [];
-      for (const psm of ["10", "8", "13"]) {
-        await worker.setParameters({
-          tessedit_char_whitelist: "123456789",
-          tessedit_pageseg_mode: psm,
-          classify_bln_numeric_mode: "1",
-        });
-        const {
-          data: { text, confidence },
-        } = await worker.recognize(padded);
-        const d = parseDigit(text);
-        if (d > 0) candidates.push({ digit: d, conf: confidence || 50 });
-      }
-      candidates.sort((a, b) => b.conf - a.conf);
-      let digit = candidates[0]?.digit || 0;
-      let conf = candidates[0]?.conf || 0;
-      if (digit === 8 && candidates.length > 1) {
-        const alt = candidates.find((x) => x.digit !== 8);
-        if (alt) {
-          const { holes } = glyphHoles(bin);
-          if (holes < 2) {
-            digit = alt.digit;
-            conf = alt.conf;
-          }
-        }
-      }
-      const { holes, holeYc } = glyphHoles(bin);
-      ({ digit, conf } = applyHoleCorrections(digit, conf, holes, holeYc));
-      out.push({ digit, confidence: digit ? conf : 0 });
+      const padded = padWhite(bin, OCR_PAD, OCR_DIGIT_SIZE);
+      // dataURL is cheaper to postMessage than ImageBitmap for many small tiles.
+      const dataUrl = padded.toDataURL("image/png");
+      jobs.push(
+        recognizeDigitJob(scheduler, dataUrl).then(({ digit, conf }) => {
+          let d = digit;
+          let cf = conf;
+          const { holes, holeYc } = glyphHoles(bin);
+          ({ digit: d, conf: cf } = applyHoleCorrections(d, cf, holes, holeYc));
+          out[i] = { digit: d, confidence: d ? cf : 0 };
+        })
+      );
     }
-    setStatus(`Reading digits… row ${r + 1}/9`);
   }
-  await worker.terminate();
+
+  const total = jobs.length;
+  setStatus(total ? `Reading ${total} cells…` : "No digits detected.");
+  let done = 0;
+  await Promise.all(
+    jobs.map((p) =>
+      p.then(() => {
+        done++;
+        if (done === total || done % 4 === 0) {
+          setStatus(`Reading digits… ${done}/${total}`);
+        }
+      })
+    )
+  );
+
   let cellsOut = resolveConflicts(out);
-  // Only drop clues if the grid is inconsistent / unsolvable — never invent a different puzzle.
   const canSolve = () => {
     if (!wasm?.solve) return true;
     try {
@@ -802,6 +889,8 @@ async function recognizeCanvas(canvas) {
   if (conflictSetFrom(cellsOut).size || !canSolve()) {
     cellsOut = repairUntilSolvable(cellsOut);
   }
+  const ms = Math.round(performance.now() - t0);
+  console.info(`OCR finished in ${ms}ms (${total} cells, ${OCR_WORKERS} workers)`);
   return cellsOut;
 }
 
@@ -1008,3 +1097,7 @@ document.getElementById("btn-rescan").addEventListener("click", () => {
 });
 
 loadWasm();
+// Warm OCR workers in the background so the first scan is faster.
+if (typeof Tesseract !== "undefined") {
+  ensureOcrScheduler().catch((e) => console.warn("OCR warm-up failed", e));
+}
