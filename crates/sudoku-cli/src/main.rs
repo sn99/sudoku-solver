@@ -79,6 +79,15 @@ fn solve_image(path: &str) -> Result<(), String> {
         }
     }
     println!("\nParsed grid:\n{grid}");
+    let clues: usize = (0..9)
+        .flat_map(|r| (0..9).map(move |c| recognized.cells[r][c].digit))
+        .filter(|&d| d > 0)
+        .count();
+    if clues < 30 {
+        eprintln!(
+            "note: only {clues} OCR clues — some cells may be missing (gray/moiré). Edit low-confidence cells if the solution looks wrong."
+        );
+    }
     let solved = grid.solve().map_err(|e| e.to_string())?;
     println!("Solution:\n{solved}");
     Ok(())

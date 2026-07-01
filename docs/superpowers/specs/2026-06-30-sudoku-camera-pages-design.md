@@ -36,7 +36,11 @@ Camera/file → centered square crop (guide frame) → 81 tiles → Tesseract.js
 
 ### Data flow (CLI)
 
-`sudoku-solver puzzle.png` → `sudoku-ocr` (rusty-tesseract) → print grid → `sudoku-core` solve.
+`sudoku-solver puzzle.png` → `sudoku-ocr` (line-peak / contour grid extract → cell binarize → rusty-tesseract) → print grid → `sudoku-core` solve.
+
+### Grid localization (2026-07 update)
+
+Borrowed techniques from OpenCV projects (mukund0502/SudokuSolver, aakashjhawar/SolveSudoku, prajwalkr/SnapSudoku, rg1990/cv-sudoku-solver, trflorian/sudoku-extraction): adaptive threshold + largest blob corners + perspective warp, plus **projection-peak** search for equally spaced 9×9 lines (best on phone photos of sudoku apps). Multi-PSM Tesseract + hole-based 6/8/9 fixes; conflict resolution drops inconsistent low-confidence digits.
 
 ## Deploy
 
@@ -44,5 +48,5 @@ GitHub Actions: `wasm-pack build crates/sudoku-wasm --target web --out-dir web/p
 
 ## Out of scope
 
-- Perspective quad detection beyond centered square + guide frame
+- Perfect OCR on every moiré phone-of-screen photo without any manual cell edits
 - Multi-puzzle pages / batch

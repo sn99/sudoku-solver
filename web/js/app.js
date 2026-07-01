@@ -41,17 +41,24 @@ function setSolveStatus(msg, kind = "") {
 }
 
 async function loadWasm() {
-  for (const url of ["./pkg/sudoku_wasm.js", "../pkg/sudoku_wasm.js"]) {
+  // Relative to this page (works on https://user.github.io/sudoku-solver/).
+  const base = new URL(".", import.meta.url);
+  const candidates = [
+    new URL("../pkg/sudoku_wasm.js", base).href,
+    new URL("./pkg/sudoku_wasm.js", base).href,
+    "./pkg/sudoku_wasm.js",
+  ];
+  for (const url of candidates) {
     try {
       const mod = await import(url);
       await mod.default();
       wasm = mod;
       return;
     } catch (e) {
-      /* try next */
+      console.warn("WASM load failed for", url, e);
     }
   }
-  setStatus("Solver WASM missing — edit grid still works.", "error");
+  setStatus("Solver WASM missing — refresh or use Enter manually.", "error");
 }
 
 function conflictSet() {
@@ -196,19 +203,134 @@ function sourceSize(source) {
   };
 }
 
-/** Match Rust find_grid_square: portrait phone photos vs full-frame digital puzzles. */
+/** Projection-peak 9×9 grid finder (mirrors Rust find_grid_by_line_peaks). */
+function findGridByLinePeaks(w, h, gray) {
+  const rowGrad = new Float32Array(h);
+  const colGrad = new Float32Array(w);
+  const step = Math.max(1, Math.floor(Math.max(w, h) / 800));
+  for (let y = 1; y < h - 1; y += step) {
+    for (let x = 1; x < w - 1; x += step) {
+      const gy = gray[(y + 1) * w + x] - gray[(y - 1) * w + x];
+      const gx = gray[y * w + (x + 1)] - gray[y * w + (x - 1)];
+      rowGrad[y] += Math.abs(gy);
+      colGrad[x] += Math.abs(gx);
+    }
+  }
+  const smooth = (v) => {
+    const o = new Float32Array(v.length);
+    for (let i = 0; i < v.length; i++) {
+      let s = 0, c = 0;
+      for (let d = -2; d <= 2; d++) {
+        const j = i + d;
+        if (j >= 0 && j < v.length) {
+          s += v[j];
+          c++;
+        }
+      }
+      o[i] = s / c;
+    }
+    return o;
+  };
+  const rg = smooth(rowGrad);
+  const cg = smooth(colGrad);
+  const scoreLines = (proj, start, cell) => {
+    const n = proj.length;
+    let mean = 0;
+    for (let i = 0; i < n; i++) mean += proj[i];
+    mean /= n || 1;
+    let sc = 0;
+    let minPeak = Infinity;
+    for (let i = 0; i < 10; i++) {
+      const y = start + i * cell;
+      if (y < 2 || y + 2 >= n) return -1;
+      let peak = 0;
+      for (let d = -2; d <= 2; d++) {
+        const yy = y + d;
+        if (yy >= 0 && yy < n) peak = Math.max(peak, proj[yy]);
+      }
+      sc += Math.max(0, peak - mean * 1.2);
+      minPeak = Math.min(minPeak, peak);
+    }
+    return sc + minPeak * 0.5;
+  };
+
+  const minCell = Math.floor(Math.min(w, h) * 0.06);
+  const maxCell = Math.floor(Math.min(w, h) * 0.14);
+  const cellStep = Math.max(1, Math.floor((maxCell - minCell) / 40));
+  let bestSc = 0;
+  let best = null;
+  for (let cell = minCell; cell <= maxCell; cell += cellStep) {
+    const span = cell * 9;
+    if (span + 4 > Math.min(w, h)) continue;
+    const maxY0 = h - span - 2;
+    const maxX0 = w - span - 2;
+    if (maxY0 < 2 || maxX0 < 2) continue;
+    const yStep = Math.max(2, Math.floor(maxY0 / 50));
+    const xStep = Math.max(2, Math.floor(maxX0 / 50));
+    for (let y0 = 2; y0 <= maxY0; y0 += yStep) {
+      const rs = scoreLines(rg, y0, cell);
+      if (rs < 0) continue;
+      for (let x0 = 2; x0 <= maxX0; x0 += xStep) {
+        const cs = scoreLines(cg, x0, cell);
+        if (cs < 0) continue;
+        const sc = rs + cs + cell * 0.8;
+        if (sc > bestSc) {
+          bestSc = sc;
+          best = { x: x0, y: y0, s: span };
+        }
+      }
+    }
+  }
+  if (!best) return null;
+  // Fine refine
+  const cell0 = Math.floor(best.s / 9);
+  let best2 = best;
+  let bestSc2 = bestSc;
+  for (let dc = -3; dc <= 3; dc++) {
+    const cell = cell0 + dc;
+    if (cell < minCell) continue;
+    const span = cell * 9;
+    for (let dy = -8; dy <= 8; dy++) {
+      for (let dx = -8; dx <= 8; dx++) {
+        const x0 = best.x + dx;
+        const y0 = best.y + dy;
+        if (x0 < 0 || y0 < 0 || x0 + span >= w || y0 + span >= h) continue;
+        const rs = scoreLines(rg, y0, cell);
+        const cs = scoreLines(cg, x0, cell);
+        const sc = rs + cs + cell * 0.8;
+        if (sc > bestSc2) {
+          bestSc2 = sc;
+          best2 = { x: x0, y: y0, s: span };
+        }
+      }
+    }
+  }
+  const inset = Math.max(1, Math.floor(best2.s * 0.01));
+  return {
+    x: best2.x + inset,
+    y: best2.y + inset,
+    s: Math.max(90, best2.s - inset * 2),
+  };
+}
+
+/** Match Rust extract_board: line peaks for embedded grids, else content square. */
 function findGridRect(w, h, gray) {
-  const portrait = h > w * 1.15;
-  if (portrait) {
-    // Calibrated priors for sudoku.com-style screenshots (same as CLI).
-    let x = Math.floor(w * 0.078);
-    let y = Math.floor(h * 0.231);
-    let s = Math.floor(Math.min(w, h) * 0.933);
-    s = Math.min(s, w - x, h - y);
-    return { x, y, s: Math.max(s, 200) };
+  const peaks = findGridByLinePeaks(w, h, gray);
+  if (peaks) {
+    const cover = (peaks.s * peaks.s) / (w * h);
+    const margin =
+      peaks.x > w / 25 ||
+      peaks.y > h / 25 ||
+      peaks.x + peaks.s < w - w / 25 ||
+      peaks.y + peaks.s < h - h / 25;
+    if (cover < 0.82 || margin) return peaks;
   }
   // Full-frame / landscape: largest content square
-  let minX = w, minY = h, maxX = 0, maxY = 0, found = false;
+  let minX = w,
+    minY = h,
+    maxX = 0,
+    maxY = 0,
+    found = false;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       if (gray[y * w + x] < 248) {
@@ -317,8 +439,19 @@ function drawSquareToCanvas(source) {
   for (let i = 0, p = 0; p < g.length; i += 4, p++) {
     g[p] = 0.299 * board.data[i] + 0.587 * board.data[i + 1] + 0.114 * board.data[i + 2];
   }
-  const portrait = h > w * 1.15;
-  g = medianFilterGray(g, GRID_SIZE, GRID_SIZE, portrait ? 5 : 3);
+  // Stronger denoise on noisy / moiré phone photos (mirrors Rust estimate_noise).
+  let noiseAcc = 0,
+    noiseN = 0;
+  const nstep = Math.max(2, Math.floor(GRID_SIZE / 100));
+  for (let y = 1; y < GRID_SIZE - 1; y += nstep) {
+    for (let x = 1; x < GRID_SIZE - 1; x += nstep) {
+      const v = g[y * GRID_SIZE + x];
+      noiseAcc += Math.abs(v - g[y * GRID_SIZE + x + 1]) + Math.abs(v - g[(y + 1) * GRID_SIZE + x]);
+      noiseN += 2;
+    }
+  }
+  const noisy = noiseAcc / Math.max(1, noiseN) > 12;
+  g = medianFilterGray(g, GRID_SIZE, GRID_SIZE, noisy ? 5 : 3);
   g = stretchContrastGray(g, GRID_SIZE, GRID_SIZE, 2, 98);
   for (let i = 0, p = 0; p < g.length; i += 4, p++) {
     board.data[i] = board.data[i + 1] = board.data[i + 2] = g[p];
@@ -328,11 +461,37 @@ function drawSquareToCanvas(source) {
   return snapCanvas;
 }
 
-function otsuLikeThresholdFromLight(vals) {
+function thresholdForCell(vals) {
   const sorted = vals.slice().sort((a, b) => a - b);
   const n = sorted.length;
   const light = Math.max(sorted[Math.floor(n * 0.88)], sorted[Math.floor(n / 2)]);
-  return Math.min(light - INK_DELTA, INK_ABS_MAX);
+  const median = sorted[Math.floor(n / 2)];
+  const p10 = sorted[Math.floor(n * 0.1)];
+  let thr = Math.min(light - INK_DELTA, INK_ABS_MAX);
+  // Gray-tinted UI cells (sudoku.com left column): bridge ink and paper.
+  if (median < 200) {
+    thr = Math.min(170, Math.floor((p10 + median) / 2));
+    thr = Math.max(thr, p10 + 8);
+  }
+  return thr;
+}
+
+function binarizeVals(vals, w, h, thr) {
+  let ink = 0;
+  const out = document.createElement("canvas");
+  out.width = w;
+  out.height = h;
+  const octx = out.getContext("2d");
+  const oid = octx.createImageData(w, h);
+  for (let p = 0, i = 0; p < vals.length; p++, i += 4) {
+    const isInk = vals[p] < thr;
+    if (isInk) ink++;
+    const v = isInk ? 0 : 255;
+    oid.data[i] = oid.data[i + 1] = oid.data[i + 2] = v;
+    oid.data[i + 3] = 255;
+  }
+  octx.putImageData(oid, 0, 0);
+  return { canvas: out, inkRatio: ink / vals.length };
 }
 
 /** @returns {{ canvas: HTMLCanvasElement, inkRatio: number }} */
@@ -347,22 +506,14 @@ function cellToBinary(srcCanvas, x, y, cell) {
   for (let i = 0; i < id.data.length; i += 4) {
     vals.push(0.299 * id.data[i] + 0.587 * id.data[i + 1] + 0.114 * id.data[i + 2]);
   }
-  const thr = otsuLikeThresholdFromLight(vals);
-  let ink = 0;
-  const out = document.createElement("canvas");
-  out.width = cw;
-  out.height = ch;
-  const octx = out.getContext("2d");
-  const oid = octx.createImageData(cw, ch);
-  for (let p = 0, i = 0; p < vals.length; p++, i += 4) {
-    const isInk = vals[p] < thr;
-    if (isInk) ink++;
-    const v = isInk ? 0 : 255;
-    oid.data[i] = oid.data[i + 1] = oid.data[i + 2] = v;
-    oid.data[i + 3] = 255;
+  let thr = thresholdForCell(vals);
+  let { canvas, inkRatio } = binarizeVals(vals, cw, ch, thr);
+  if (inkRatio < MIN_INK_RATIO) {
+    // Faint digits on gray cells — retry more aggressive threshold.
+    thr = Math.min(200, thr + 18);
+    ({ canvas, inkRatio } = binarizeVals(vals, cw, ch, thr));
   }
-  octx.putImageData(oid, 0, 0);
-  return { canvas: out, inkRatio: ink / vals.length };
+  return { canvas, inkRatio };
 }
 
 function padWhite(tile, pad, size) {
@@ -638,8 +789,64 @@ async function recognizeCanvas(canvas) {
   }
   await worker.terminate();
   let cellsOut = resolveConflicts(out);
-  cellsOut = repairUntilSolvable(cellsOut);
+  // Only drop clues if the grid is inconsistent / unsolvable — never invent a different puzzle.
+  const canSolve = () => {
+    if (!wasm?.solve) return true;
+    try {
+      wasm.solve(Uint8Array.from(cellsOut.map((c) => c.digit)));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (conflictSetFrom(cellsOut).size || !canSolve()) {
+    cellsOut = repairUntilSolvable(cellsOut);
+  }
   return cellsOut;
+}
+
+function conflictSetFrom(list) {
+  const bad = new Set();
+  const d = list.map((c) => c.digit);
+  const mark = (i, j) => {
+    bad.add(i);
+    bad.add(j);
+  };
+  for (let r = 0; r < 9; r++) {
+    const seen = new Map();
+    for (let c = 0; c < 9; c++) {
+      const v = d[r * 9 + c];
+      if (!v) continue;
+      const i = r * 9 + c;
+      if (seen.has(v)) mark(i, seen.get(v));
+      else seen.set(v, i);
+    }
+  }
+  for (let c = 0; c < 9; c++) {
+    const seen = new Map();
+    for (let r = 0; r < 9; r++) {
+      const v = d[r * 9 + c];
+      if (!v) continue;
+      const i = r * 9 + c;
+      if (seen.has(v)) mark(i, seen.get(v));
+      else seen.set(v, i);
+    }
+  }
+  for (let br = 0; br < 3; br++) {
+    for (let bc = 0; bc < 3; bc++) {
+      const seen = new Map();
+      for (let r = br * 3; r < br * 3 + 3; r++) {
+        for (let c = bc * 3; c < bc * 3 + 3; c++) {
+          const v = d[r * 9 + c];
+          if (!v) continue;
+          const i = r * 9 + c;
+          if (seen.has(v)) mark(i, seen.get(v));
+          else seen.set(v, i);
+        }
+      }
+    }
+  }
+  return bad;
 }
 
 async function processSource(source) {
@@ -664,14 +871,17 @@ async function processSource(source) {
     cells = cells.map((c) => ({ ...c, _wasGiven: c.digit > 0 }));
     activeIndex = 0;
     const filled = cells.filter((c) => c.digit > 0).length;
+    const low = cells.filter((c) => c.digit > 0 && c.confidence >= 0 && c.confidence < LOW_CONF_UI).length;
     setStatus(
-      `OCR done — ${filled} digits. Check yellow cells, fix with the pad if needed, then Solve.`,
-      "ok"
+      filled >= 20
+        ? `OCR done — ${filled} digits${low ? ` (${low} low-confidence)` : ""}. Fix yellow cells if needed, then Solve.`
+        : `OCR found only ${filled} digits — fill missing cells with the pad, then Solve.`,
+      filled >= 17 ? "ok" : "error"
     );
     showBoard();
   } catch (e) {
     console.error(e);
-    setStatus(`OCR failed: ${e.message || e}`, "error");
+    setStatus(`OCR failed: ${e.message || e}. Try Upload photo or Enter manually.`, "error");
   }
 }
 
@@ -726,15 +936,18 @@ document.getElementById("btn-manual").addEventListener("click", () => {
 
 document.getElementById("btn-solve").addEventListener("click", () => {
   if (!wasm?.solve) {
-    setSolveStatus("WASM solver not loaded.", "error");
+    setSolveStatus("WASM solver not loaded — refresh the page.", "error");
     return;
   }
-  // Drop conflicting / low-confidence OCR mistakes so Solve can succeed.
   cells = resolveConflicts(cells.map((c) => ({ ...c })));
-  cells = repairUntilSolvable(cells.map((c) => ({ ...c })));
   renderBoard();
   if (conflictSet().size) {
     setSolveStatus("Fix conflicting digits (red) first.", "error");
+    return;
+  }
+  const clueCount = cells.filter((c) => c.digit > 0).length;
+  if (clueCount < 17) {
+    setSolveStatus(`Need more clues (have ${clueCount}). Fill empty cells, then Solve.`, "error");
     return;
   }
   try {
@@ -743,18 +956,38 @@ document.getElementById("btn-solve").addEventListener("click", () => {
       confidence: c.confidence,
       _wasGiven: c.digit > 0,
     }));
-    const result = wasm.solve(digitsArray());
+    let digits = digitsArray();
+    let result;
+    try {
+      result = wasm.solve(digits);
+    } catch (firstErr) {
+      // Last resort: drop lowest-confidence OCR cells until solvable.
+      const repaired = repairUntilSolvable(cells.map((c) => ({ ...c })));
+      const dropped = clueCount - repaired.filter((c) => c.digit > 0).length;
+      cells = repaired;
+      renderBoard();
+      digits = digitsArray();
+      result = wasm.solve(digits);
+      if (dropped > 0) {
+        setSolveStatus(`Solved after clearing ${dropped} conflicting OCR cell(s). Verify solution.`, "ok");
+      }
+    }
     const arr = result instanceof Uint8Array ? result : Uint8Array.from(result);
     cells = Array.from(arr, (digit, i) => ({
       digit,
-      confidence: givens[i].confidence,
-      _wasGiven: givens[i]._wasGiven,
+      confidence: givens[i]?.confidence ?? 100,
+      _wasGiven: givens[i]?._wasGiven ?? false,
     }));
     solutionMode = true;
     renderBoard();
-    setSolveStatus("Solved.", "ok");
+    if (!document.getElementById("solve-status").textContent.startsWith("Solved after")) {
+      setSolveStatus("Solved.", "ok");
+    }
   } catch (e) {
-    setSolveStatus(String(e.message || e), "error");
+    setSolveStatus(
+      `${e.message || e} — add missing clues (yellow/empty) and try again.`,
+      "error"
+    );
   }
 });
 

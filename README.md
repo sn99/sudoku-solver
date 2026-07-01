@@ -8,6 +8,7 @@ Rust Sudoku solver with **camera / photo scan** on [GitHub Pages](https://sn99.g
 
 - **Web (GitHub Pages):** open the rear camera or upload a photo, OCR digits (Tesseract.js), edit low-confidence cells, solve with **Rust compiled to WASM**
 - **CLI:** type a grid on stdin, or pass an image path to OCR with **rusty-tesseract** (system Tesseract required)
+- **Grid detection:** projection-peak 9×9 localization (phone photos of apps), adaptive threshold + contour/warp fallbacks inspired by OpenCV solvers (SolveSudoku, SnapSudoku, sudoku-extraction), then per-cell binarization + multi-PSM Tesseract
 
 ## Web app
 
