@@ -4,19 +4,19 @@
 
 const CONFIDENCE_THRESHOLD = 30;
 const LOW_CONF_UI = 65;
-/** Board working resolution — 540 is enough for digit OCR and much faster than 900. */
-const GRID_SIZE = 540;
-const CELL_INSET = 0.15;
+/** Higher board res improves gray-cell / moiré digits (sudoku.com screenshots). */
+const GRID_SIZE = 720;
+const CELL_INSET = 0.14;
 const INK_DELTA = 28;
 const INK_ABS_MAX = 180;
-const MIN_INK_RATIO = 0.003;
+const MIN_INK_RATIO = 0.0025;
 const MAX_INK_RATIO = 0.55;
-const OCR_DIGIT_SIZE = 48;
-const OCR_PAD = 8;
-/** One worker is most reliable; multi-worker warm-up often freezes mobile browsers. */
-const OCR_WORKERS = 1;
-const OCR_CELL_TIMEOUT_MS = 12000;
-const OCR_TOTAL_TIMEOUT_MS = 90000;
+/** Reject OCR guesses below this unless topology (holes) is decisive. */
+const MIN_ACCEPT_CONF = 42;
+const OCR_DIGIT_SIZE = 64;
+const OCR_PAD = 12;
+const OCR_CELL_TIMEOUT_MS = 10000;
+const OCR_TOTAL_TIMEOUT_MS = 120000;
 
 const statusEl = document.getElementById("status");
 const solveStatusEl = document.getElementById("solve-status");
@@ -518,19 +518,52 @@ function drawSquareToCanvas(source) {
   return snapCanvas;
 }
 
-function thresholdForCell(vals) {
+function otsuThreshold(vals) {
+  const hist = new Array(256).fill(0);
+  for (const v of vals) hist[v | 0]++;
+  const total = vals.length;
+  let sum = 0;
+  for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let sumB = 0;
+  let wB = 0;
+  let best = 0;
+  let bestThr = 128;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t];
+    if (!wB) continue;
+    const wF = total - wB;
+    if (!wF) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB;
+    const mF = (sum - sumB) / wF;
+    const between = wB * wF * (mB - mF) * (mB - mF);
+    if (between >= best) {
+      best = between;
+      bestThr = t;
+    }
+  }
+  return bestThr;
+}
+
+function thresholdCandidates(vals) {
   const sorted = vals.slice().sort((a, b) => a - b);
   const n = sorted.length;
   const light = Math.max(sorted[Math.floor(n * 0.88)], sorted[Math.floor(n / 2)]);
   const median = sorted[Math.floor(n / 2)];
   const p10 = sorted[Math.floor(n * 0.1)];
-  let thr = Math.min(light - INK_DELTA, INK_ABS_MAX);
-  // Gray-tinted UI cells (sudoku.com left column): bridge ink and paper.
-  if (median < 200) {
-    thr = Math.min(170, Math.floor((p10 + median) / 2));
-    thr = Math.max(thr, p10 + 8);
-  }
-  return thr;
+  const p15 = sorted[Math.floor(n * 0.15)];
+  const lightThr = Math.min(light - INK_DELTA, INK_ABS_MAX);
+  const grayThr = Math.min(175, Math.max(p10 + 10, Math.floor((p15 + median) / 2)));
+  const otsu = otsuThreshold(vals);
+  // Unique-ish list: default, Otsu, gray-friendly, aggressive.
+  const set = new Set([
+    lightThr,
+    Math.min(200, otsu + 5),
+    grayThr,
+    Math.min(200, lightThr + 20),
+    Math.min(200, otsu + 15),
+  ]);
+  return [...set];
 }
 
 function binarizeVals(vals, w, h, thr) {
@@ -551,8 +584,8 @@ function binarizeVals(vals, w, h, thr) {
   return { canvas: out, inkRatio: ink / vals.length };
 }
 
-/** @returns {{ canvas: HTMLCanvasElement, inkRatio: number }} */
-function cellToBinary(srcCanvas, x, y, cell) {
+/** @returns {{ bins: {canvas: HTMLCanvasElement, inkRatio: number}[], primary: {canvas, inkRatio} }} */
+function cellToBinaryVariants(srcCanvas, x, y, cell) {
   const ix = Math.floor(cell * CELL_INSET);
   const iy = Math.floor(cell * CELL_INSET);
   const cw = Math.max(1, cell - 2 * ix);
@@ -563,14 +596,26 @@ function cellToBinary(srcCanvas, x, y, cell) {
   for (let i = 0; i < id.data.length; i += 4) {
     vals.push(0.299 * id.data[i] + 0.587 * id.data[i + 1] + 0.114 * id.data[i + 2]);
   }
-  let thr = thresholdForCell(vals);
-  let { canvas, inkRatio } = binarizeVals(vals, cw, ch, thr);
-  if (inkRatio < MIN_INK_RATIO) {
-    // Faint digits on gray cells — retry more aggressive threshold.
-    thr = Math.min(200, thr + 18);
-    ({ canvas, inkRatio } = binarizeVals(vals, cw, ch, thr));
+  const bins = [];
+  for (const thr of thresholdCandidates(vals)) {
+    const b = binarizeVals(vals, cw, ch, thr);
+    if (b.inkRatio >= MIN_INK_RATIO && b.inkRatio <= MAX_INK_RATIO) bins.push(b);
   }
-  return { canvas, inkRatio };
+  if (!bins.length) {
+    const b = binarizeVals(vals, cw, ch, thresholdCandidates(vals)[0]);
+    return { bins: [], primary: b };
+  }
+  // Prefer moderate ink (typical digit ~2–20%).
+  bins.sort((a, b) => {
+    const score = (r) => -Math.abs(Math.log((r.inkRatio + 1e-4) / 0.08));
+    return score(b) - score(a);
+  });
+  return { bins: bins.slice(0, 3), primary: bins[0] };
+}
+
+/** @returns {{ canvas: HTMLCanvasElement, inkRatio: number }} */
+function cellToBinary(srcCanvas, x, y, cell) {
+  return cellToBinaryVariants(srcCanvas, x, y, cell).primary;
 }
 
 function padWhite(tile, pad, size) {
@@ -824,6 +869,92 @@ async function ensureOcrWorker() {
   }
 }
 
+async function ocrOneBin(worker, bin, psm) {
+  const padded = padWhite(bin, OCR_PAD, OCR_DIGIT_SIZE);
+  await worker.setParameters({
+    tessedit_char_whitelist: "123456789",
+    tessedit_pageseg_mode: String(psm),
+    classify_bln_numeric_mode: "1",
+  });
+  const {
+    data: { text, confidence },
+  } = await withTimeout(worker.recognize(padded), OCR_CELL_TIMEOUT_MS, `psm${psm}`);
+  return { digit: parseDigit(text), conf: confidence || 0 };
+}
+
+/**
+ * Prefer empty over a weak wrong digit. Primary threshold + PSM-10 first;
+ * extra thresholds/PSM only when the first pass is weak (gray/moiré cells).
+ */
+async function recognizeCellDigit(worker, bins) {
+  const votes = new Map();
+  let bestBin = bins[0].canvas;
+
+  const record = (bin, digit, conf) => {
+    if (digit <= 0) return;
+    const prev = votes.get(digit) || 0;
+    if (conf >= prev) {
+      votes.set(digit, conf);
+      bestBin = bin;
+    }
+  };
+
+  // Fast path: best bin, PSM 10.
+  try {
+    const { digit, conf } = await ocrOneBin(worker, bins[0].canvas, 10);
+    record(bins[0].canvas, digit, conf);
+  } catch {
+    /* fall through */
+  }
+
+  let topConf = votes.size ? Math.max(...votes.values()) : 0;
+  const needMore = votes.size === 0 || topConf < MIN_ACCEPT_CONF + 10;
+
+  if (needMore) {
+    for (let bi = 0; bi < bins.length; bi++) {
+      const bin = bins[bi].canvas;
+      for (const psm of bi === 0 ? [8] : [10, 8]) {
+        try {
+          const { digit, conf } = await ocrOneBin(worker, bin, psm);
+          record(bin, digit, conf);
+        } catch {
+          /* next */
+        }
+      }
+    }
+  }
+
+  let digit = 0;
+  let conf = 0;
+  for (const [d, c] of votes) {
+    if (c > conf) {
+      digit = d;
+      conf = c;
+    }
+  }
+  if (votes.size >= 2) {
+    const ranked = [...votes.entries()].sort((a, b) => b[1] - a[1]);
+    if (ranked[0][1] - ranked[1][1] < 10) {
+      digit = 0;
+      conf = 0;
+    }
+  }
+
+  const { holes, holeYc } = glyphHoles(bestBin);
+  ({ digit, conf } = applyHoleCorrections(digit, conf, holes, holeYc));
+  if (holes >= 2) {
+    digit = 8;
+    conf = Math.max(conf, 90);
+  } else if (holes === 1 && (digit === 0 || digit === 6 || digit === 9)) {
+    digit = holeYc[0] < 0.5 ? 9 : 6;
+    conf = Math.max(conf, 88);
+  }
+  if (digit > 0 && conf < MIN_ACCEPT_CONF && holes === 0) {
+    return { digit: 0, confidence: conf };
+  }
+  return { digit, confidence: digit ? conf : 0 };
+}
+
 async function recognizeCanvas(canvas) {
   if (ocrBusy) throw new Error("OCR already running — wait for the current scan.");
   ocrBusy = true;
@@ -837,16 +968,13 @@ async function recognizeCanvas(canvas) {
     for (let r = 0; r < 9; r++) {
       for (let c = 0; c < 9; c++) {
         const i = r * 9 + c;
-        const { canvas: bin, inkRatio } = cellToBinary(canvas, c * cell, r * cell, cell);
-        if (inkRatio < MIN_INK_RATIO) {
-          out[i] = { digit: 0, confidence: 100 };
+        const { bins, primary } = cellToBinaryVariants(canvas, c * cell, r * cell, cell);
+        if (!bins.length) {
+          if (primary.inkRatio < MIN_INK_RATIO) out[i] = { digit: 0, confidence: 100 };
+          else out[i] = { digit: 0, confidence: 15 };
           continue;
         }
-        if (inkRatio > MAX_INK_RATIO) {
-          out[i] = { digit: 0, confidence: 15 };
-          continue;
-        }
-        todo.push({ i, bin });
+        todo.push({ i, bins });
       }
     }
 
@@ -854,46 +982,26 @@ async function recognizeCanvas(canvas) {
     setStatus(total ? `Reading ${total} cells…` : "No digits detected.");
     await yieldToUi();
 
-    // Sequential OCR on one worker (stable). Update UI every cell so it never “hangs”.
     for (let k = 0; k < todo.length; k++) {
       if (performance.now() - t0 > OCR_TOTAL_TIMEOUT_MS) {
         setStatus("OCR taking too long — fill missing cells manually.", "error");
         break;
       }
-      const { i, bin } = todo[k];
-      const padded = padWhite(bin, OCR_PAD, OCR_DIGIT_SIZE);
+      const { i, bins } = todo[k];
       try {
-        const {
-          data: { text, confidence },
-        } = await withTimeout(worker.recognize(padded), OCR_CELL_TIMEOUT_MS, `cell ${k}`);
-        let digit = parseDigit(text);
-        let conf = confidence || 0;
-        const { holes, holeYc } = glyphHoles(bin);
-        ({ digit, conf } = applyHoleCorrections(digit, conf, holes, holeYc));
-        out[i] = { digit, confidence: digit ? conf : 0 };
+        out[i] = await recognizeCellDigit(worker, bins);
       } catch (err) {
         console.warn("cell OCR failed", err);
         out[i] = { digit: 0, confidence: 0 };
       }
-      if (k === total - 1 || k % 3 === 0) {
+      if (k === total - 1 || k % 2 === 0) {
         setStatus(`Reading digits… ${k + 1}/${total}`);
         await yieldToUi();
       }
     }
 
+    // Conflicts only — do not drop clues just to force a (possibly wrong) solution.
     let cellsOut = resolveConflicts(out);
-    const canSolve = () => {
-      if (!wasm?.solve) return true;
-      try {
-        wasm.solve(Uint8Array.from(cellsOut.map((c) => c.digit)));
-        return true;
-      } catch {
-        return false;
-      }
-    };
-    if (conflictSetFrom(cellsOut).size || !canSolve()) {
-      cellsOut = repairUntilSolvable(cellsOut);
-    }
     console.info(`OCR finished in ${Math.round(performance.now() - t0)}ms (${total} cells)`);
     return cellsOut;
   } finally {
@@ -1059,9 +1167,23 @@ document.getElementById("btn-solve").addEventListener("click", () => {
     return;
   }
   const clueCount = cells.filter((c) => c.digit > 0).length;
+  const emptyCount = 81 - clueCount;
   if (clueCount < 17) {
-    setSolveStatus(`Need more clues (have ${clueCount}). Fill empty cells, then Solve.`, "error");
+    setSolveStatus(`Need more clues (have ${clueCount}). Fill empty cells from the photo, then Solve.`, "error");
     return;
+  }
+  // Partial OCR of a unique puzzle can still admit *another* valid completion.
+  // Ask the user to fill empties that should have givens before trusting Solve.
+  if (emptyCount > 45 || clueCount < 28) {
+    const ok = confirm(
+      `Only ${clueCount} clues were read (${emptyCount} empty). ` +
+        `If any empty cell should have a digit from your photo, fill it first — ` +
+        `otherwise Solve may show a different valid puzzle.\n\nSolve with current clues anyway?`
+    );
+    if (!ok) {
+      setSolveStatus("Fill empty cells that match the photo, then Solve.", "error");
+      return;
+    }
   }
   try {
     const givens = cells.map((c) => ({
@@ -1074,7 +1196,6 @@ document.getElementById("btn-solve").addEventListener("click", () => {
     try {
       result = wasm.solve(digits);
     } catch (firstErr) {
-      // Last resort: drop lowest-confidence OCR cells until solvable.
       const repaired = repairUntilSolvable(cells.map((c) => ({ ...c })));
       const dropped = clueCount - repaired.filter((c) => c.digit > 0).length;
       cells = repaired;
@@ -1082,7 +1203,7 @@ document.getElementById("btn-solve").addEventListener("click", () => {
       digits = digitsArray();
       result = wasm.solve(digits);
       if (dropped > 0) {
-        setSolveStatus(`Solved after clearing ${dropped} conflicting OCR cell(s). Verify solution.`, "ok");
+        setSolveStatus(`Solved after clearing ${dropped} conflicting OCR cell(s). Verify vs photo.`, "ok");
       }
     }
     const arr = result instanceof Uint8Array ? result : Uint8Array.from(result);
@@ -1094,7 +1215,12 @@ document.getElementById("btn-solve").addEventListener("click", () => {
     solutionMode = true;
     renderBoard();
     if (!document.getElementById("solve-status").textContent.startsWith("Solved after")) {
-      setSolveStatus("Solved.", "ok");
+      setSolveStatus(
+        emptyCount > 40
+          ? "Solved from partial OCR — verify against your photo."
+          : "Solved.",
+        "ok"
+      );
     }
   } catch (e) {
     setSolveStatus(
