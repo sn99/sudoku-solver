@@ -12,7 +12,8 @@ permissions:
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  # Do not cancel in-progress deploys (avoids "Deployment cancelled" races).
+  cancel-in-progress: false
 
 jobs:
   build:
