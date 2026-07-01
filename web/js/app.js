@@ -1093,10 +1093,10 @@ async function processSource(source) {
     const filled = cells.filter((c) => c.digit > 0).length;
     const low = cells.filter((c) => c.digit > 0 && c.confidence >= 0 && c.confidence < LOW_CONF_UI).length;
     setStatus(
-      filled >= 20
-        ? `OCR done — ${filled} digits${low ? ` (${low} low-confidence)` : ""}. Fix yellow cells if needed, then Solve.`
-        : `OCR found only ${filled} digits — fill missing cells with the pad, then Solve.`,
-      filled >= 17 ? "ok" : "error"
+      filled >= 32
+        ? `OCR done — ${filled} digits${low ? ` (${low} low-confidence)` : ""}. Check yellow cells, then Solve.`
+        : `OCR read ${filled} digits — compare to your photo and fill empty cells that should have numbers (gray cells are easy to miss), then Solve.`,
+      filled >= 22 ? "ok" : "error"
     );
     showBoard();
   } catch (e) {
