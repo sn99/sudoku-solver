@@ -228,14 +228,13 @@ function sourceSize(source) {
 }
 
 /**
- * Fast projection-peak 9×9 finder. Precomputes projection means once and uses a
- * coarse grid so phone photos don't freeze the main thread for tens of seconds.
+ * Projection-peak 9×9 finder (closer to Rust). Finer search + portrait priors so we
+ * don't lock onto UI chrome below the board (that shifted cells by ~2 rows).
  */
 function findGridByLinePeaks(w, h, gray) {
   const rowGrad = new Float32Array(h);
   const colGrad = new Float32Array(w);
-  // Subsample aggressively for speed on high-DPI photos.
-  const step = Math.max(2, Math.floor(Math.max(w, h) / 400));
+  const step = Math.max(1, Math.floor(Math.max(w, h) / 800));
   for (let y = 1; y < h - 1; y += step) {
     for (let x = 1; x < w - 1; x += step) {
       const gy = gray[(y + 1) * w + x] - gray[(y - 1) * w + x];
@@ -244,21 +243,26 @@ function findGridByLinePeaks(w, h, gray) {
       colGrad[x] += Math.abs(gx);
     }
   }
-  // Light 3-tap smooth + mean (once).
-  const smoothMean = (v) => {
+  const smooth = (v) => {
     const o = new Float32Array(v.length);
-    let sum = 0;
     for (let i = 0; i < v.length; i++) {
-      const a = v[Math.max(0, i - 1)];
-      const b = v[i];
-      const c = v[Math.min(v.length - 1, i + 1)];
-      o[i] = (a + b + c) / 3;
-      sum += o[i];
+      let s = 0,
+        c = 0;
+      for (let d = -2; d <= 2; d++) {
+        const j = i + d;
+        if (j >= 0 && j < v.length) {
+          s += v[j];
+          c++;
+        }
+      }
+      o[i] = s / c;
     }
-    return { o, mean: sum / (v.length || 1) };
+    return o;
   };
-  const { o: rg, mean: rowMean } = smoothMean(rowGrad);
-  const { o: cg, mean: colMean } = smoothMean(colGrad);
+  const rg = smooth(rowGrad);
+  const cg = smooth(colGrad);
+  const rowMean = rg.reduce((a, b) => a + b, 0) / (rg.length || 1);
+  const colMean = cg.reduce((a, b) => a + b, 0) / (cg.length || 1);
 
   const scoreLines = (proj, mean, start, cell) => {
     const n = proj.length;
@@ -266,37 +270,44 @@ function findGridByLinePeaks(w, h, gray) {
     let minPeak = Infinity;
     for (let i = 0; i < 10; i++) {
       const y = start + i * cell;
-      if (y < 1 || y + 1 >= n) return -1;
-      const peak = Math.max(proj[y - 1], proj[y], proj[y + 1]);
-      sc += Math.max(0, peak - mean * 1.15);
+      if (y < 2 || y + 2 >= n) return -1;
+      let peak = 0;
+      for (let d = -2; d <= 2; d++) peak = Math.max(peak, proj[y + d] || 0);
+      sc += Math.max(0, peak - mean * 1.2);
       minPeak = Math.min(minPeak, peak);
     }
-    return sc + minPeak * 0.4;
+    return sc + minPeak * 0.5;
   };
 
+  const portrait = h > w * 1.15;
   const minSide = Math.min(w, h);
-  const minCell = Math.floor(minSide * 0.07);
-  const maxCell = Math.floor(minSide * 0.13);
-  // ~12 cell sizes × ~25 starts — intentional upper bound on work.
-  const cellStep = Math.max(2, Math.ceil((maxCell - minCell) / 12));
-  let bestSc = 0;
+  const minCell = Math.floor(minSide * 0.06);
+  const maxCell = Math.floor(minSide * 0.14);
+  const cellStep = Math.max(1, Math.floor((maxCell - minCell) / 40));
+  let bestSc = -1;
   let best = null;
+
+  // Portrait phone UIs: board sits in the upper/mid band — never start too low.
+  const yLo = portrait ? Math.floor(h * 0.12) : 2;
+  const yHiFrac = portrait ? 0.55 : 0.95;
 
   for (let cell = minCell; cell <= maxCell; cell += cellStep) {
     const span = cell * 9;
     if (span + 4 > minSide) continue;
-    const maxY0 = h - span - 2;
+    const maxY0 = Math.min(h - span - 2, Math.floor(h * yHiFrac));
     const maxX0 = w - span - 2;
-    if (maxY0 < 2 || maxX0 < 2) continue;
-    const yStep = Math.max(4, Math.floor(maxY0 / 24));
-    const xStep = Math.max(4, Math.floor(maxX0 / 24));
-    for (let y0 = 2; y0 <= maxY0; y0 += yStep) {
+    if (maxY0 < yLo || maxX0 < 2) continue;
+    const yStep = Math.max(2, Math.floor((maxY0 - yLo) / 40));
+    const xStep = Math.max(2, Math.floor(maxX0 / 40));
+    for (let y0 = yLo; y0 <= maxY0; y0 += yStep) {
       const rs = scoreLines(rg, rowMean, y0, cell);
       if (rs < 0) continue;
       for (let x0 = 2; x0 <= maxX0; x0 += xStep) {
         const cs = scoreLines(cg, colMean, x0, cell);
         if (cs < 0) continue;
-        const sc = rs + cs + cell * 0.5;
+        // Prefer larger boards; slight preference for higher placement on portrait.
+        let sc = rs + cs + cell * 0.8;
+        if (portrait) sc += (1 - y0 / h) * 80;
         if (sc > bestSc) {
           bestSc = sc;
           best = { x: x0, y: y0, s: span };
@@ -304,25 +315,53 @@ function findGridByLinePeaks(w, h, gray) {
       }
     }
   }
+
+  // Portrait priors (sudoku.com framing) — score and compete with peaks.
+  if (portrait) {
+    const priors = [
+      [0.078, 0.231, 0.9],
+      [0.06, 0.22, 0.88],
+      [0.08, 0.24, 0.85],
+      [0.05, 0.2, 0.9],
+      [0.07, 0.25, 0.84],
+    ];
+    for (const [xf, yf, sf] of priors) {
+      const x0 = Math.floor(w * xf);
+      const y0 = Math.floor(h * yf);
+      const span = Math.floor(Math.min(w, h) * sf);
+      if (x0 + span >= w || y0 + span >= h) continue;
+      const cell = Math.floor(span / 9);
+      const rs = scoreLines(rg, rowMean, y0, cell);
+      const cs = scoreLines(cg, colMean, x0, cell);
+      if (rs < 0 || cs < 0) continue;
+      const sc = rs + cs + cell * 0.8 + (1 - y0 / h) * 80 + 40; // bonus for known priors
+      if (sc > bestSc) {
+        bestSc = sc;
+        best = { x: x0, y: y0, s: span };
+      }
+    }
+  }
+
   if (!best) return null;
 
-  // Small local refine only (not ±8 on all cell sizes).
   const cell0 = Math.floor(best.s / 9);
   let best2 = best;
   let bestSc2 = bestSc;
-  for (let dc = -2; dc <= 2; dc++) {
+  for (let dc = -3; dc <= 3; dc++) {
     const cell = cell0 + dc;
     if (cell < minCell) continue;
     const span = cell * 9;
-    for (let dy = -4; dy <= 4; dy += 2) {
-      for (let dx = -4; dx <= 4; dx += 2) {
+    for (let dy = -8; dy <= 8; dy += 2) {
+      for (let dx = -8; dx <= 8; dx += 2) {
         const x0 = best.x + dx;
         const y0 = best.y + dy;
         if (x0 < 0 || y0 < 0 || x0 + span >= w || y0 + span >= h) continue;
+        if (portrait && y0 > h * 0.55) continue;
         const sc =
           scoreLines(rg, rowMean, y0, cell) +
           scoreLines(cg, colMean, x0, cell) +
-          cell * 0.5;
+          cell * 0.8 +
+          (portrait ? (1 - y0 / h) * 40 : 0);
         if (sc > bestSc2) {
           bestSc2 = sc;
           best2 = { x: x0, y: y0, s: span };
@@ -330,7 +369,7 @@ function findGridByLinePeaks(w, h, gray) {
       }
     }
   }
-  const inset = Math.max(1, Math.floor(best2.s * 0.01));
+  const inset = Math.max(1, Math.floor(best2.s * 0.012));
   return {
     x: best2.x + inset,
     y: best2.y + inset,
@@ -1186,30 +1225,13 @@ async function processSource(source) {
     activeIndex = 0;
     const filled = cells.filter((c) => c.digit > 0).length;
     const low = cells.filter((c) => c.digit > 0 && c.confidence >= 0 && c.confidence < LOW_CONF_UI).length;
-    // Auto-solve when we have enough consistent clues (Rust path recovers the true puzzle).
-    let autoNote = "";
-    if (filled >= 28 && wasm?.solve && !conflictSet().size) {
-      try {
-        const result = wasm.solve(digitsArray());
-        const arr = result instanceof Uint8Array ? result : Uint8Array.from(result);
-        const givens = cells.map((c) => ({ ...c }));
-        cells = Array.from(arr, (digit, i) => ({
-          digit,
-          confidence: givens[i].confidence,
-          _wasGiven: givens[i].digit > 0,
-        }));
-        solutionMode = true;
-        autoNote = " Solved automatically from OCR clues (verify against photo).";
-      } catch (_) {
-        /* leave board for manual edit */
-      }
-    }
+    // Do NOT auto-solve: a misaligned crop + partial OCR can invent a different
+    // valid puzzle. User verifies the grid against the photo, then taps Solve.
     setStatus(
-      (filled >= 28
-        ? `OCR done — ${filled} reliable digits${low ? ` (${low} low-confidence)` : ""}.`
-        : `OCR read ${filled} digits — fill any empty cells that match your photo, then Solve.`) +
-        autoNote,
-      filled >= 22 || solutionMode ? "ok" : "error"
+      filled >= 28
+        ? `OCR done — ${filled} digits${low ? ` (${low} low-confidence)` : ""}. Compare to the photo (especially top rows), fix if needed, then Solve.`
+        : `OCR read ${filled} digits — fill empties that match the photo, then Solve.`,
+      filled >= 22 ? "ok" : "error"
     );
     showBoard();
   } catch (e) {
