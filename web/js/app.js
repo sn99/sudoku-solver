@@ -1045,9 +1045,23 @@ async function recognizeCellDigit(worker, bins) {
   }
 
   const { holes, holeYc } = glyphHoles(bestBin);
-  if (holes >= 2) {
+  const ctx = bestBin.getContext("2d");
+  const { width: bw, height: bh } = bestBin;
+  const bd = ctx.getImageData(0, 0, bw, bh).data;
+  let inkN = 0;
+  for (let i = 0; i < bd.length; i += 4) if (bd[i] < 128) inkN++;
+  const inkRatio = inkN / (bw * bh);
+
+  // Grid-line crumbs often look like "8" (two small holes). Only force 8 with real mass.
+  if (holes >= 2 && inkRatio >= 0.08 && digit !== 0) {
     digit = 8;
     conf = Math.max(conf, 90);
+  } else if (holes >= 2 && inkRatio < 0.08) {
+    // Noise holes — do not invent an 8.
+    if (digit === 8) {
+      digit = 0;
+      conf = 0;
+    }
   } else if (holes === 1 && (digit === 0 || digit === 2 || digit === 5)) {
     digit = holeYc[0] < 0.42 ? 9 : 6;
     conf = Math.max(conf, 88);
@@ -1057,7 +1071,7 @@ async function recognizeCellDigit(worker, bins) {
   } else if (holes === 1 && digit === 6 && holeYc[0] < 0.38) {
     digit = 9;
     conf = Math.max(conf, 88);
-  } else {
+  } else if (!(holes >= 2 && inkRatio < 0.08)) {
     ({ digit, conf } = applyHoleCorrections(digit, conf, holes, holeYc));
   }
 
@@ -1065,21 +1079,18 @@ async function recognizeCellDigit(worker, bins) {
   if (lastCapturePortrait && digit === 1) {
     return { digit: 0, confidence: 0 };
   }
-  // Bright thin cells misread as 5 after suppressing 1s.
-  if (lastCapturePortrait && digit === 5) {
-    // reject if bin is very sparse (thin stroke, not a real 5)
-    const ctx = bestBin.getContext("2d");
-    const { width: w, height: h } = bestBin;
-    const d = ctx.getImageData(0, 0, w, h).data;
-    let ink = 0;
-    for (let i = 0; i < d.length; i += 4) if (d[i] < 128) ink++;
-    if (ink / (w * h) < 0.07) return { digit: 0, confidence: 0 };
+  if (lastCapturePortrait && digit === 5 && inkRatio < 0.07) {
+    return { digit: 0, confidence: 0 };
+  }
+  // Spurious 8s on empty corners (grid line / chrome).
+  if (digit === 8 && (inkRatio < 0.09 || conf < 55)) {
+    return { digit: 0, confidence: 0 };
   }
 
   if (digit > 0 && conf < MIN_ACCEPT_CONF && holes === 0) {
     return { digit: 0, confidence: conf };
   }
-  if (lastCapturePortrait && digit > 0 && holes === 0 && conf < 58 && digit !== 4 && digit !== 8) {
+  if (lastCapturePortrait && digit > 0 && holes === 0 && conf < 58 && digit !== 4) {
     return { digit: 0, confidence: 0 };
   }
   if (!glyphIsCoherent(bestBin) && digit > 0) {
