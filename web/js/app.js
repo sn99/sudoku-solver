@@ -952,6 +952,13 @@ async function recognizeCellDigit(worker, bins) {
   if (digit > 0 && conf < MIN_ACCEPT_CONF && holes === 0) {
     return { digit: 0, confidence: conf };
   }
+  // Prefer empty over flaky open digits on moiré (matches Rust policy).
+  if (digit > 0 && holes === 0 && conf < 58 && digit !== 4 && digit !== 8) {
+    return { digit: 0, confidence: 0 };
+  }
+  if (digit === 1 && conf < 80) {
+    return { digit: 0, confidence: 0 };
+  }
   return { digit, confidence: digit ? conf : 0 };
 }
 
