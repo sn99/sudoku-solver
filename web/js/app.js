@@ -626,17 +626,42 @@ function binarizeVals(vals, w, h, thr) {
   return { canvas: out, inkRatio: ink / vals.length };
 }
 
-/** Local min–max stretch (critical for gray sudoku.com cells). */
+/**
+ * Local min–max stretch (critical for gray sudoku.com cells).
+ * Skip stretch on nearly-blank / low-contrast tiles — stretching moiré turns empties into fake ink/holes (false 8s).
+ * @returns {{ vals: number[], span: number, mean: number, lo: number, hi: number, stretched: boolean }}
+ */
 function stretchVals(vals) {
   let lo = 255,
-    hi = 0;
+    hi = 0,
+    sum = 0;
   for (const v of vals) {
     if (v < lo) lo = v;
     if (v > hi) hi = v;
+    sum += v;
   }
-  if (hi <= lo + 12) return vals.slice();
+  const mean = sum / (vals.length || 1);
   const span = hi - lo;
-  return vals.map((v) => Math.round(((v - lo) / span) * 255));
+  // Empty / grid-line noise: no real dark ink.
+  if (span <= 50 || (mean > 215 && span < 90) || lo > 190) {
+    return { vals: vals.slice(), span, mean, lo, hi, stretched: false };
+  }
+  if (span <= 12) {
+    return { vals: vals.slice(), span, mean, lo, hi, stretched: false };
+  }
+  return {
+    vals: vals.map((v) => Math.round(((v - lo) / span) * 255)),
+    span,
+    mean,
+    lo,
+    hi,
+    stretched: true,
+  };
+}
+
+/** True when the cell looks empty (no digit ink worth OCR). */
+function cellLooksEmpty(span, mean, lo) {
+  return span <= 50 || (mean > 215 && span < 90) || lo > 190;
 }
 
 function glyphIsCoherent(binCanvas) {
@@ -697,7 +722,13 @@ function cellToBinaryVariants(srcCanvas, x, y, cell) {
   for (let i = 0; i < id.data.length; i += 4) {
     vals.push(0.299 * id.data[i] + 0.587 * id.data[i + 1] + 0.114 * id.data[i + 2]);
   }
-  vals = stretchVals(vals);
+  const stretch = stretchVals(vals);
+  vals = stretch.vals;
+  // Blank cells: do not invent glyphs from stretched moiré / grid crumbs.
+  if (cellLooksEmpty(stretch.span, stretch.mean, stretch.lo)) {
+    const b = binarizeVals(vals, cw, ch, 128);
+    return { bins: [], primary: { canvas: b.canvas, inkRatio: 0 } };
+  }
   const thrs = [...thresholdCandidates(vals), 190, 200];
   const bins = [];
   for (const thr of new Set(thrs)) {
@@ -856,7 +887,10 @@ function parseDigit(text) {
 }
 
 function applyHoleCorrections(digit, conf, holes, holeYc) {
-  if (holes >= 2) return { digit: 8, conf: Math.max(conf, 92) };
+  // Do not invent 8 from holes alone — moiré empty cells get 2+ fake holes.
+  if (holes >= 2 && digit !== 0 && conf >= 50) {
+    return { digit: 8, conf: Math.max(conf, 92) };
+  }
   if (holes === 1) {
     const yc = holeYc[0];
     if (digit === 0) return { digit: yc < 0.5 ? 9 : 6, conf: 92 };
@@ -864,8 +898,8 @@ function applyHoleCorrections(digit, conf, holes, holeYc) {
     if (digit === 5 && yc > 0.52) return { digit: 6, conf: Math.max(conf, 95) };
     if (digit === 6 || digit === 9) return { digit: yc < 0.5 ? 9 : 6, conf: Math.max(conf, 95) };
   }
-  if (digit === 8 && holes < 2) {
-    return { digit: holes === 0 ? 4 : digit, conf: Math.max(conf, 60) };
+  if (digit === 8 && holes === 0) {
+    return { digit: 4, conf: Math.max(conf, 60) };
   }
   return { digit, conf };
 }
@@ -983,7 +1017,15 @@ async function ocrOneBin(worker, bin, psm) {
   const {
     data: { text, confidence },
   } = await withTimeout(worker.recognize(padded), OCR_CELL_TIMEOUT_MS, `psm${psm}`);
-  return { digit: parseDigit(text), conf: confidence || 0 };
+  const digit = parseDigit(text);
+  // Tesseract.js often returns confidence 0 even when the whitelist digit is correct.
+  let conf = confidence || 0;
+  if (digit > 0 && conf < 40) {
+    const cleaned = (text || "").replace(/[^1-9]/g, "");
+    if (cleaned.length === 1) conf = Math.max(conf, 55);
+    else if (cleaned.length >= 1) conf = Math.max(conf, 48);
+  }
+  return { digit, conf };
 }
 
 /**
@@ -1053,10 +1095,10 @@ async function recognizeCellDigit(worker, bins) {
   const inkRatio = inkN / (bw * bh);
 
   // Grid-line crumbs often look like "8" (two small holes). Only force 8 with real mass.
-  if (holes >= 2 && inkRatio >= 0.08 && digit !== 0) {
+  if (holes >= 2 && inkRatio >= 0.12 && digit !== 0 && conf >= 40) {
     digit = 8;
     conf = Math.max(conf, 90);
-  } else if (holes >= 2 && inkRatio < 0.08) {
+  } else if (holes >= 2 && inkRatio < 0.1) {
     // Noise holes — do not invent an 8.
     if (digit === 8) {
       digit = 0;
@@ -1071,26 +1113,41 @@ async function recognizeCellDigit(worker, bins) {
   } else if (holes === 1 && digit === 6 && holeYc[0] < 0.38) {
     digit = 9;
     conf = Math.max(conf, 88);
-  } else if (!(holes >= 2 && inkRatio < 0.08)) {
+  } else if (!(holes >= 2 && inkRatio < 0.1)) {
     ({ digit, conf } = applyHoleCorrections(digit, conf, holes, holeYc));
   }
 
   // Portrait phone-of-app: never emit "1" (moiré false positives) — same as Rust.
   if (lastCapturePortrait && digit === 1) {
-    return { digit: 0, confidence: 0 };
+    // "19" / broken 9 often misread as 1 — recover 9 when there is a hole.
+    if (holes === 1) {
+      digit = holeYc[0] < 0.5 ? 9 : 6;
+      conf = Math.max(conf, 70);
+    } else {
+      return { digit: 0, confidence: 0 };
+    }
   }
   if (lastCapturePortrait && digit === 5 && inkRatio < 0.07) {
     return { digit: 0, confidence: 0 };
   }
-  // Spurious 8s on empty corners (grid line / chrome).
-  if (digit === 8 && (inkRatio < 0.09 || conf < 55)) {
-    return { digit: 0, confidence: 0 };
+  // Spurious 8s from grid-line junctions / moiré. Keep real 8s with solid ink+conf
+  // even when topology only finds one hole (common on moiré phone photos).
+  if (digit === 8) {
+    const strong8 = inkRatio >= 0.1 && conf >= 70;
+    const topology8 = holes >= 2 && inkRatio >= 0.11;
+    if (!strong8 && !topology8) {
+      return { digit: 0, confidence: 0 };
+    }
   }
 
-  if (digit > 0 && conf < MIN_ACCEPT_CONF && holes === 0) {
+  // Accept a clear single-digit read even if Tess conf is oddly low (common in browser).
+  if (digit > 0 && conf < MIN_ACCEPT_CONF && holes === 0 && inkRatio < 0.06) {
     return { digit: 0, confidence: conf };
   }
-  if (lastCapturePortrait && digit > 0 && holes === 0 && conf < 58 && digit !== 4) {
+  if (digit > 0 && conf < 35 && holes === 0) {
+    return { digit: 0, confidence: conf };
+  }
+  if (lastCapturePortrait && digit > 0 && holes === 0 && conf < 45 && digit !== 4 && inkRatio < 0.08) {
     return { digit: 0, confidence: 0 };
   }
   if (!glyphIsCoherent(bestBin) && digit > 0) {
