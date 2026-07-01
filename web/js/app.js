@@ -11,9 +11,12 @@ const INK_DELTA = 28;
 const INK_ABS_MAX = 180;
 const MIN_INK_RATIO = 0.003;
 const MAX_INK_RATIO = 0.55;
-const OCR_DIGIT_SIZE = 56;
-const OCR_PAD = 10;
-const OCR_WORKERS = Math.min(4, Math.max(2, (navigator.hardwareConcurrency || 4) >> 1));
+const OCR_DIGIT_SIZE = 48;
+const OCR_PAD = 8;
+/** One worker is most reliable; multi-worker warm-up often freezes mobile browsers. */
+const OCR_WORKERS = 1;
+const OCR_CELL_TIMEOUT_MS = 12000;
+const OCR_TOTAL_TIMEOUT_MS = 90000;
 
 const statusEl = document.getElementById("status");
 const solveStatusEl = document.getElementById("solve-status");
@@ -29,9 +32,22 @@ let wasm = null;
 let cells = emptyCells();
 let solutionMode = false;
 let activeIndex = 0;
-/** @type {import('tesseract.js').Scheduler | null} */
-let ocrScheduler = null;
+/** @type {import('tesseract.js').Worker | null} */
+let ocrWorker = null;
 let ocrWarmPromise = null;
+let ocrBusy = false;
+
+function yieldToUi() {
+  return new Promise((r) => setTimeout(r, 0));
+}
+
+function withTimeout(promise, ms, label) {
+  let t;
+  const timeout = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
 
 function emptyCells() {
   return Array.from({ length: 81 }, () => ({ digit: 0, confidence: -1 }));
@@ -209,11 +225,15 @@ function sourceSize(source) {
   };
 }
 
-/** Projection-peak 9×9 grid finder (mirrors Rust find_grid_by_line_peaks). */
+/**
+ * Fast projection-peak 9×9 finder. Precomputes projection means once and uses a
+ * coarse grid so phone photos don't freeze the main thread for tens of seconds.
+ */
 function findGridByLinePeaks(w, h, gray) {
   const rowGrad = new Float32Array(h);
   const colGrad = new Float32Array(w);
-  const step = Math.max(1, Math.floor(Math.max(w, h) / 800));
+  // Subsample aggressively for speed on high-DPI photos.
+  const step = Math.max(2, Math.floor(Math.max(w, h) / 400));
   for (let y = 1; y < h - 1; y += step) {
     for (let x = 1; x < w - 1; x += step) {
       const gy = gray[(y + 1) * w + x] - gray[(y - 1) * w + x];
@@ -222,64 +242,59 @@ function findGridByLinePeaks(w, h, gray) {
       colGrad[x] += Math.abs(gx);
     }
   }
-  const smooth = (v) => {
+  // Light 3-tap smooth + mean (once).
+  const smoothMean = (v) => {
     const o = new Float32Array(v.length);
+    let sum = 0;
     for (let i = 0; i < v.length; i++) {
-      let s = 0, c = 0;
-      for (let d = -2; d <= 2; d++) {
-        const j = i + d;
-        if (j >= 0 && j < v.length) {
-          s += v[j];
-          c++;
-        }
-      }
-      o[i] = s / c;
+      const a = v[Math.max(0, i - 1)];
+      const b = v[i];
+      const c = v[Math.min(v.length - 1, i + 1)];
+      o[i] = (a + b + c) / 3;
+      sum += o[i];
     }
-    return o;
+    return { o, mean: sum / (v.length || 1) };
   };
-  const rg = smooth(rowGrad);
-  const cg = smooth(colGrad);
-  const scoreLines = (proj, start, cell) => {
+  const { o: rg, mean: rowMean } = smoothMean(rowGrad);
+  const { o: cg, mean: colMean } = smoothMean(colGrad);
+
+  const scoreLines = (proj, mean, start, cell) => {
     const n = proj.length;
-    let mean = 0;
-    for (let i = 0; i < n; i++) mean += proj[i];
-    mean /= n || 1;
     let sc = 0;
     let minPeak = Infinity;
     for (let i = 0; i < 10; i++) {
       const y = start + i * cell;
-      if (y < 2 || y + 2 >= n) return -1;
-      let peak = 0;
-      for (let d = -2; d <= 2; d++) {
-        const yy = y + d;
-        if (yy >= 0 && yy < n) peak = Math.max(peak, proj[yy]);
-      }
-      sc += Math.max(0, peak - mean * 1.2);
+      if (y < 1 || y + 1 >= n) return -1;
+      const peak = Math.max(proj[y - 1], proj[y], proj[y + 1]);
+      sc += Math.max(0, peak - mean * 1.15);
       minPeak = Math.min(minPeak, peak);
     }
-    return sc + minPeak * 0.5;
+    return sc + minPeak * 0.4;
   };
 
-  const minCell = Math.floor(Math.min(w, h) * 0.06);
-  const maxCell = Math.floor(Math.min(w, h) * 0.14);
-  const cellStep = Math.max(1, Math.floor((maxCell - minCell) / 40));
+  const minSide = Math.min(w, h);
+  const minCell = Math.floor(minSide * 0.07);
+  const maxCell = Math.floor(minSide * 0.13);
+  // ~12 cell sizes × ~25 starts — intentional upper bound on work.
+  const cellStep = Math.max(2, Math.ceil((maxCell - minCell) / 12));
   let bestSc = 0;
   let best = null;
+
   for (let cell = minCell; cell <= maxCell; cell += cellStep) {
     const span = cell * 9;
-    if (span + 4 > Math.min(w, h)) continue;
+    if (span + 4 > minSide) continue;
     const maxY0 = h - span - 2;
     const maxX0 = w - span - 2;
     if (maxY0 < 2 || maxX0 < 2) continue;
-    const yStep = Math.max(2, Math.floor(maxY0 / 50));
-    const xStep = Math.max(2, Math.floor(maxX0 / 50));
+    const yStep = Math.max(4, Math.floor(maxY0 / 24));
+    const xStep = Math.max(4, Math.floor(maxX0 / 24));
     for (let y0 = 2; y0 <= maxY0; y0 += yStep) {
-      const rs = scoreLines(rg, y0, cell);
+      const rs = scoreLines(rg, rowMean, y0, cell);
       if (rs < 0) continue;
       for (let x0 = 2; x0 <= maxX0; x0 += xStep) {
-        const cs = scoreLines(cg, x0, cell);
+        const cs = scoreLines(cg, colMean, x0, cell);
         if (cs < 0) continue;
-        const sc = rs + cs + cell * 0.8;
+        const sc = rs + cs + cell * 0.5;
         if (sc > bestSc) {
           bestSc = sc;
           best = { x: x0, y: y0, s: span };
@@ -288,22 +303,24 @@ function findGridByLinePeaks(w, h, gray) {
     }
   }
   if (!best) return null;
-  // Fine refine
+
+  // Small local refine only (not ±8 on all cell sizes).
   const cell0 = Math.floor(best.s / 9);
   let best2 = best;
   let bestSc2 = bestSc;
-  for (let dc = -3; dc <= 3; dc++) {
+  for (let dc = -2; dc <= 2; dc++) {
     const cell = cell0 + dc;
     if (cell < minCell) continue;
     const span = cell * 9;
-    for (let dy = -8; dy <= 8; dy++) {
-      for (let dx = -8; dx <= 8; dx++) {
+    for (let dy = -4; dy <= 4; dy += 2) {
+      for (let dx = -4; dx <= 4; dx += 2) {
         const x0 = best.x + dx;
         const y0 = best.y + dy;
         if (x0 < 0 || y0 < 0 || x0 + span >= w || y0 + span >= h) continue;
-        const rs = scoreLines(rg, y0, cell);
-        const cs = scoreLines(cg, x0, cell);
-        const sc = rs + cs + cell * 0.8;
+        const sc =
+          scoreLines(rg, rowMean, y0, cell) +
+          scoreLines(cg, colMean, x0, cell) +
+          cell * 0.5;
         if (sc > bestSc2) {
           bestSc2 = sc;
           best2 = { x: x0, y: y0, s: span };
@@ -777,121 +794,111 @@ function repairUntilSolvable(cells) {
   return cells;
 }
 
-async function ensureOcrScheduler() {
-  if (ocrScheduler) return ocrScheduler;
+async function ensureOcrWorker() {
+  if (ocrWorker) return ocrWorker;
   if (ocrWarmPromise) return ocrWarmPromise;
   ocrWarmPromise = (async () => {
-    setStatus(`Starting OCR (${OCR_WORKERS} workers)…`);
-    const scheduler = Tesseract.createScheduler();
-    const workers = await Promise.all(
-      Array.from({ length: OCR_WORKERS }, async () => {
-        const w = await Tesseract.createWorker("eng", 1, { logger: () => {} });
-        await w.setParameters({
-          tessedit_char_whitelist: "123456789",
-          tessedit_pageseg_mode: "10",
-          classify_bln_numeric_mode: "1",
-        });
-        return w;
-      })
+    setStatus("Loading OCR engine…");
+    const w = await withTimeout(
+      Tesseract.createWorker("eng", 1, {
+        logger: () => {},
+        // Prefer CDN defaults; avoid custom paths that can hang offline.
+      }),
+      45000,
+      "Tesseract worker load"
     );
-    for (const w of workers) scheduler.addWorker(w);
-    ocrScheduler = scheduler;
-    return scheduler;
+    await w.setParameters({
+      tessedit_char_whitelist: "123456789",
+      tessedit_pageseg_mode: "10",
+      classify_bln_numeric_mode: "1",
+    });
+    ocrWorker = w;
+    return w;
   })();
   try {
     return await ocrWarmPromise;
   } catch (e) {
     ocrWarmPromise = null;
+    ocrWorker = null;
     throw e;
   }
 }
 
-/** Recognize one digit image; one fast PSM-10 pass, optional PSM-8 only if needed. */
-async function recognizeDigitJob(scheduler, dataUrl) {
-  let {
-    data: { text, confidence },
-  } = await scheduler.addJob("recognize", dataUrl);
-  let digit = parseDigit(text);
-  let conf = confidence || 0;
-  if (digit === 0 || conf < FAST_OCR_CONF) {
-    // Second pass only for uncertain cells (much faster than always doing 3 PSMs).
-    const retry = await scheduler.addJob("recognize", dataUrl, {
-      tessedit_pageseg_mode: "8",
-    });
-    const d2 = parseDigit(retry.data.text);
-    const c2 = retry.data.confidence || 0;
-    if (d2 > 0 && (digit === 0 || c2 > conf)) {
-      digit = d2;
-      conf = c2;
-    }
-  }
-  return { digit, conf };
-}
-
 async function recognizeCanvas(canvas) {
+  if (ocrBusy) throw new Error("OCR already running — wait for the current scan.");
+  ocrBusy = true;
   const t0 = performance.now();
-  const scheduler = await ensureOcrScheduler();
-  const cell = GRID_SIZE / 9;
-  const out = Array.from({ length: 81 }, () => ({ digit: 0, confidence: 100 }));
-  const jobs = [];
+  try {
+    const worker = await ensureOcrWorker();
+    const cell = GRID_SIZE / 9;
+    const out = Array.from({ length: 81 }, () => ({ digit: 0, confidence: 100 }));
+    const todo = [];
 
-  for (let r = 0; r < 9; r++) {
-    for (let c = 0; c < 9; c++) {
-      const i = r * 9 + c;
-      const { canvas: bin, inkRatio } = cellToBinary(canvas, c * cell, r * cell, cell);
-      if (inkRatio < MIN_INK_RATIO) {
-        out[i] = { digit: 0, confidence: 100 };
-        continue;
-      }
-      if (inkRatio > MAX_INK_RATIO) {
-        out[i] = { digit: 0, confidence: 15 };
-        continue;
-      }
-      const padded = padWhite(bin, OCR_PAD, OCR_DIGIT_SIZE);
-      // dataURL is cheaper to postMessage than ImageBitmap for many small tiles.
-      const dataUrl = padded.toDataURL("image/png");
-      jobs.push(
-        recognizeDigitJob(scheduler, dataUrl).then(({ digit, conf }) => {
-          let d = digit;
-          let cf = conf;
-          const { holes, holeYc } = glyphHoles(bin);
-          ({ digit: d, conf: cf } = applyHoleCorrections(d, cf, holes, holeYc));
-          out[i] = { digit: d, confidence: d ? cf : 0 };
-        })
-      );
-    }
-  }
-
-  const total = jobs.length;
-  setStatus(total ? `Reading ${total} cells…` : "No digits detected.");
-  let done = 0;
-  await Promise.all(
-    jobs.map((p) =>
-      p.then(() => {
-        done++;
-        if (done === total || done % 4 === 0) {
-          setStatus(`Reading digits… ${done}/${total}`);
+    for (let r = 0; r < 9; r++) {
+      for (let c = 0; c < 9; c++) {
+        const i = r * 9 + c;
+        const { canvas: bin, inkRatio } = cellToBinary(canvas, c * cell, r * cell, cell);
+        if (inkRatio < MIN_INK_RATIO) {
+          out[i] = { digit: 0, confidence: 100 };
+          continue;
         }
-      })
-    )
-  );
-
-  let cellsOut = resolveConflicts(out);
-  const canSolve = () => {
-    if (!wasm?.solve) return true;
-    try {
-      wasm.solve(Uint8Array.from(cellsOut.map((c) => c.digit)));
-      return true;
-    } catch {
-      return false;
+        if (inkRatio > MAX_INK_RATIO) {
+          out[i] = { digit: 0, confidence: 15 };
+          continue;
+        }
+        todo.push({ i, bin });
+      }
     }
-  };
-  if (conflictSetFrom(cellsOut).size || !canSolve()) {
-    cellsOut = repairUntilSolvable(cellsOut);
+
+    const total = todo.length;
+    setStatus(total ? `Reading ${total} cells…` : "No digits detected.");
+    await yieldToUi();
+
+    // Sequential OCR on one worker (stable). Update UI every cell so it never “hangs”.
+    for (let k = 0; k < todo.length; k++) {
+      if (performance.now() - t0 > OCR_TOTAL_TIMEOUT_MS) {
+        setStatus("OCR taking too long — fill missing cells manually.", "error");
+        break;
+      }
+      const { i, bin } = todo[k];
+      const padded = padWhite(bin, OCR_PAD, OCR_DIGIT_SIZE);
+      try {
+        const {
+          data: { text, confidence },
+        } = await withTimeout(worker.recognize(padded), OCR_CELL_TIMEOUT_MS, `cell ${k}`);
+        let digit = parseDigit(text);
+        let conf = confidence || 0;
+        const { holes, holeYc } = glyphHoles(bin);
+        ({ digit, conf } = applyHoleCorrections(digit, conf, holes, holeYc));
+        out[i] = { digit, confidence: digit ? conf : 0 };
+      } catch (err) {
+        console.warn("cell OCR failed", err);
+        out[i] = { digit: 0, confidence: 0 };
+      }
+      if (k === total - 1 || k % 3 === 0) {
+        setStatus(`Reading digits… ${k + 1}/${total}`);
+        await yieldToUi();
+      }
+    }
+
+    let cellsOut = resolveConflicts(out);
+    const canSolve = () => {
+      if (!wasm?.solve) return true;
+      try {
+        wasm.solve(Uint8Array.from(cellsOut.map((c) => c.digit)));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    if (conflictSetFrom(cellsOut).size || !canSolve()) {
+      cellsOut = repairUntilSolvable(cellsOut);
+    }
+    console.info(`OCR finished in ${Math.round(performance.now() - t0)}ms (${total} cells)`);
+    return cellsOut;
+  } finally {
+    ocrBusy = false;
   }
-  const ms = Math.round(performance.now() - t0);
-  console.info(`OCR finished in ${ms}ms (${total} cells, ${OCR_WORKERS} workers)`);
-  return cellsOut;
 }
 
 function conflictSetFrom(list) {
@@ -939,8 +946,13 @@ function conflictSetFrom(list) {
 }
 
 async function processSource(source) {
+  if (ocrBusy) {
+    setStatus("Already scanning — please wait.", "error");
+    return;
+  }
   try {
     setStatus("Preparing image…");
+    await yieldToUi();
     if (source === video) {
       const { w, h } = sourceSize(video);
       const t = document.createElement("canvas");
@@ -955,7 +967,18 @@ async function processSource(source) {
       previewImg.classList.remove("hidden");
       video.classList.add("hidden");
     }
-    const canvas = drawSquareToCanvas(source);
+    await yieldToUi();
+    setStatus("Finding grid…");
+    await yieldToUi();
+    let canvas;
+    try {
+      canvas = drawSquareToCanvas(source);
+    } catch (e) {
+      console.error(e);
+      setStatus(`Could not find grid: ${e.message || e}`, "error");
+      return;
+    }
+    await yieldToUi();
     cells = await recognizeCanvas(canvas);
     cells = cells.map((c) => ({ ...c, _wasGiven: c.digit > 0 }));
     activeIndex = 0;
@@ -970,7 +993,8 @@ async function processSource(source) {
     showBoard();
   } catch (e) {
     console.error(e);
-    setStatus(`OCR failed: ${e.message || e}. Try Upload photo or Enter manually.`, "error");
+    ocrBusy = false;
+    setStatus(`OCR failed: ${e.message || e}. Try again or Enter manually.`, "error");
   }
 }
 
@@ -1097,7 +1121,7 @@ document.getElementById("btn-rescan").addEventListener("click", () => {
 });
 
 loadWasm();
-// Warm OCR workers in the background so the first scan is faster.
+// Warm a single OCR worker in the background (non-blocking).
 if (typeof Tesseract !== "undefined") {
-  ensureOcrScheduler().catch((e) => console.warn("OCR warm-up failed", e));
+  ensureOcrWorker().catch((e) => console.warn("OCR warm-up failed", e));
 }
