@@ -36,6 +36,8 @@ let activeIndex = 0;
 let ocrWorker = null;
 let ocrWarmPromise = null;
 let ocrBusy = false;
+/** Portrait phone photos of apps — suppress flaky "1" reads (matches Rust). */
+let lastCapturePortrait = false;
 
 function yieldToUi() {
   return new Promise((r) => setTimeout(r, 0));
@@ -463,6 +465,7 @@ function boxBlurGray(gray, w, h, radius) {
 
 function drawSquareToCanvas(source) {
   const { w: sw, h: sh } = sourceSize(source);
+  lastCapturePortrait = sh > sw * 1.15;
   // Downscale huge phone photos before grid search (biggest win for line-peak scan).
   const maxDetect = 720;
   const detScale = Math.min(1, maxDetect / Math.max(sw, sh));
@@ -584,6 +587,65 @@ function binarizeVals(vals, w, h, thr) {
   return { canvas: out, inkRatio: ink / vals.length };
 }
 
+/** Local min–max stretch (critical for gray sudoku.com cells). */
+function stretchVals(vals) {
+  let lo = 255,
+    hi = 0;
+  for (const v of vals) {
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  if (hi <= lo + 12) return vals.slice();
+  const span = hi - lo;
+  return vals.map((v) => Math.round(((v - lo) / span) * 255));
+}
+
+function glyphIsCoherent(binCanvas) {
+  const ctx = binCanvas.getContext("2d");
+  const { width: w, height: h } = binCanvas;
+  const d = ctx.getImageData(0, 0, w, h).data;
+  const ink = [];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (d[(y * w + x) * 4] < 128) ink.push(y * w + x);
+    }
+  }
+  if (ink.length < 10) return false;
+  // BFS largest component
+  const seen = new Uint8Array(w * h);
+  let best = 0;
+  const q = [];
+  for (const start of ink) {
+    if (seen[start]) continue;
+    let n = 0;
+    q.length = 0;
+    q.push(start);
+    seen[start] = 1;
+    for (let qi = 0; qi < q.length; qi++) {
+      const i = q[qi];
+      n++;
+      const x = i % w,
+        y = (i / w) | 0;
+      for (const [dx, dy] of [
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ]) {
+        const nx = x + dx,
+          ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+        const j = ny * w + nx;
+        if (seen[j] || d[j * 4] >= 128) continue;
+        seen[j] = 1;
+        q.push(j);
+      }
+    }
+    if (n > best) best = n;
+  }
+  return best / ink.length >= 0.55;
+}
+
 /** @returns {{ bins: {canvas: HTMLCanvasElement, inkRatio: number}[], primary: {canvas, inkRatio} }} */
 function cellToBinaryVariants(srcCanvas, x, y, cell) {
   const ix = Math.floor(cell * CELL_INSET);
@@ -592,25 +654,28 @@ function cellToBinaryVariants(srcCanvas, x, y, cell) {
   const ch = Math.max(1, cell - 2 * iy);
   const ctx = srcCanvas.getContext("2d", { willReadFrequently: true });
   const id = ctx.getImageData(x + ix, y + iy, cw, ch);
-  const vals = [];
+  let vals = [];
   for (let i = 0; i < id.data.length; i += 4) {
     vals.push(0.299 * id.data[i] + 0.587 * id.data[i + 1] + 0.114 * id.data[i + 2]);
   }
+  vals = stretchVals(vals);
+  const thrs = [...thresholdCandidates(vals), 190, 200];
   const bins = [];
-  for (const thr of thresholdCandidates(vals)) {
+  for (const thr of new Set(thrs)) {
     const b = binarizeVals(vals, cw, ch, thr);
-    if (b.inkRatio >= MIN_INK_RATIO && b.inkRatio <= MAX_INK_RATIO) bins.push(b);
+    if (b.inkRatio >= MIN_INK_RATIO && b.inkRatio <= MAX_INK_RATIO && glyphIsCoherent(b.canvas)) {
+      bins.push(b);
+    }
   }
   if (!bins.length) {
-    const b = binarizeVals(vals, cw, ch, thresholdCandidates(vals)[0]);
+    const b = binarizeVals(vals, cw, ch, thresholdCandidates(vals)[0] || 180);
     return { bins: [], primary: b };
   }
-  // Prefer moderate ink (typical digit ~2–20%).
   bins.sort((a, b) => {
     const score = (r) => -Math.abs(Math.log((r.inkRatio + 1e-4) / 0.08));
     return score(b) - score(a);
   });
-  return { bins: bins.slice(0, 3), primary: bins[0] };
+  return { bins: bins.slice(0, 4), primary: bins[0] };
 }
 
 /** @returns {{ canvas: HTMLCanvasElement, inkRatio: number }} */
@@ -941,22 +1006,44 @@ async function recognizeCellDigit(worker, bins) {
   }
 
   const { holes, holeYc } = glyphHoles(bestBin);
-  ({ digit, conf } = applyHoleCorrections(digit, conf, holes, holeYc));
   if (holes >= 2) {
     digit = 8;
     conf = Math.max(conf, 90);
-  } else if (holes === 1 && (digit === 0 || digit === 6 || digit === 9)) {
-    digit = holeYc[0] < 0.5 ? 9 : 6;
+  } else if (holes === 1 && (digit === 0 || digit === 2 || digit === 5)) {
+    digit = holeYc[0] < 0.42 ? 9 : 6;
     conf = Math.max(conf, 88);
+  } else if (holes === 1 && digit === 9 && holeYc[0] > 0.55) {
+    digit = 6;
+    conf = Math.max(conf, 88);
+  } else if (holes === 1 && digit === 6 && holeYc[0] < 0.38) {
+    digit = 9;
+    conf = Math.max(conf, 88);
+  } else {
+    ({ digit, conf } = applyHoleCorrections(digit, conf, holes, holeYc));
   }
+
+  // Portrait phone-of-app: never emit "1" (moiré false positives) — same as Rust.
+  if (lastCapturePortrait && digit === 1) {
+    return { digit: 0, confidence: 0 };
+  }
+  // Bright thin cells misread as 5 after suppressing 1s.
+  if (lastCapturePortrait && digit === 5) {
+    // reject if bin is very sparse (thin stroke, not a real 5)
+    const ctx = bestBin.getContext("2d");
+    const { width: w, height: h } = bestBin;
+    const d = ctx.getImageData(0, 0, w, h).data;
+    let ink = 0;
+    for (let i = 0; i < d.length; i += 4) if (d[i] < 128) ink++;
+    if (ink / (w * h) < 0.07) return { digit: 0, confidence: 0 };
+  }
+
   if (digit > 0 && conf < MIN_ACCEPT_CONF && holes === 0) {
     return { digit: 0, confidence: conf };
   }
-  // Prefer empty over flaky open digits on moiré (matches Rust policy).
-  if (digit > 0 && holes === 0 && conf < 58 && digit !== 4 && digit !== 8) {
+  if (lastCapturePortrait && digit > 0 && holes === 0 && conf < 58 && digit !== 4 && digit !== 8) {
     return { digit: 0, confidence: 0 };
   }
-  if (digit === 1 && conf < 80) {
+  if (!glyphIsCoherent(bestBin) && digit > 0) {
     return { digit: 0, confidence: 0 };
   }
   return { digit, confidence: digit ? conf : 0 };
@@ -1099,11 +1186,30 @@ async function processSource(source) {
     activeIndex = 0;
     const filled = cells.filter((c) => c.digit > 0).length;
     const low = cells.filter((c) => c.digit > 0 && c.confidence >= 0 && c.confidence < LOW_CONF_UI).length;
+    // Auto-solve when we have enough consistent clues (Rust path recovers the true puzzle).
+    let autoNote = "";
+    if (filled >= 28 && wasm?.solve && !conflictSet().size) {
+      try {
+        const result = wasm.solve(digitsArray());
+        const arr = result instanceof Uint8Array ? result : Uint8Array.from(result);
+        const givens = cells.map((c) => ({ ...c }));
+        cells = Array.from(arr, (digit, i) => ({
+          digit,
+          confidence: givens[i].confidence,
+          _wasGiven: givens[i].digit > 0,
+        }));
+        solutionMode = true;
+        autoNote = " Solved automatically from OCR clues (verify against photo).";
+      } catch (_) {
+        /* leave board for manual edit */
+      }
+    }
     setStatus(
-      filled >= 32
-        ? `OCR done — ${filled} digits${low ? ` (${low} low-confidence)` : ""}. Check yellow cells, then Solve.`
-        : `OCR read ${filled} digits — compare to your photo and fill empty cells that should have numbers (gray cells are easy to miss), then Solve.`,
-      filled >= 22 ? "ok" : "error"
+      (filled >= 28
+        ? `OCR done — ${filled} reliable digits${low ? ` (${low} low-confidence)` : ""}.`
+        : `OCR read ${filled} digits — fill any empty cells that match your photo, then Solve.`) +
+        autoNote,
+      filled >= 22 || solutionMode ? "ok" : "error"
     );
     showBoard();
   } catch (e) {
