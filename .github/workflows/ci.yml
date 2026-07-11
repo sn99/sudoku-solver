@@ -11,9 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install Tesseract
-        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
       - name: Test core
         run: cargo test -p sudoku-core
-      - name: Build CLI
-        run: cargo build -p sudoku-cli --release
+      - name: Check wasm crate
+        run: cargo check -p sudoku-wasm

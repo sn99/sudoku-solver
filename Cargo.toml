@@ -2,11 +2,9 @@
 resolver = "2"
 members = [
     "crates/sudoku-core",
-    "crates/sudoku-ocr",
-    "crates/sudoku-cli",
     "crates/sudoku-wasm",
 ]
-default-members = ["crates/sudoku-cli"]
+default-members = ["crates/sudoku-core"]
 
 [workspace.package]
 version = "0.2.0"
@@ -17,4 +15,3 @@ repository = "https://github.com/sn99/sudoku-solver"
 
 [workspace.dependencies]
 sudoku-core = { path = "crates/sudoku-core" }
-sudoku-ocr = { path = "crates/sudoku-ocr" }

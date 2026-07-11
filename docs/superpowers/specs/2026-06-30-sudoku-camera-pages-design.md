@@ -9,38 +9,27 @@
 - **Editable grid** with **low OCR confidence** highlights
 - **Solve** using the existing Rust backtracking algorithm
 - Host the interactive app on **GitHub Pages**
-- Keep the project **Rust-first**; use **rusty-tesseract** for native OCR
+- Keep the project **Rust-first** for the solver (WASM); vision runs in the browser
 
 ## Constraints
 
-- `rusty-tesseract` / native Tesseract FFI **cannot run in the browser**
-- GitHub Pages is static only (no server-side Tesseract)
+- GitHub Pages is static only (no server-side processing)
 
 ## Architecture
 
-Cargo workspace:
+Cargo workspace (CLI / native OCR crates removed):
 
 | Crate / path | Role |
 | --- | --- |
 | `crates/sudoku-core` | Grid, parse, validate, solve |
-| `crates/sudoku-ocr` | Full-frame grid OCR via **rusty-tesseract** (`image_to_data` confidence) |
-| `crates/sudoku-cli` | Binary: stdin text or image path |
 | `crates/sudoku-wasm` | `solve` / `validate_givens` for the browser |
-| `web/` | Camera, upload, Tesseract.js OCR, editable UI |
+| `web/` | Camera, upload, CV + pretrained digit CNN, editable UI |
 
-Shared model: each cell is `{ digit: 0–9, confidence: 0–100 }` (or unknown). Thresholds: accept digit if conf ≥ 45; UI highlights conf &lt; 70.
+Shared model: each cell is `{ digit: 0–9, confidence: 0–100 }` (or unknown).
 
 ### Data flow (Pages)
 
-Camera/file → centered square crop (guide frame) → 81 tiles → Tesseract.js (whitelist `1-9`, single char) → editable board → Rust WASM `solve` → show solution (clues vs filled).
-
-### Data flow (CLI)
-
-`sudoku-solver puzzle.png` → `sudoku-ocr` (line-peak / contour grid extract → cell binarize → rusty-tesseract) → print grid → `sudoku-core` solve.
-
-### Grid localization (2026-07 update)
-
-Borrowed techniques from OpenCV projects (mukund0502/SudokuSolver, aakashjhawar/SolveSudoku, prajwalkr/SnapSudoku, rg1990/cv-sudoku-solver, trflorian/sudoku-extraction): adaptive threshold + largest blob corners + perspective warp, plus **projection-peak** search for equally spaced 9×9 lines (best on phone photos of sudoku apps). Multi-PSM Tesseract + hole-based 6/8/9 fixes; conflict resolution drops inconsistent low-confidence digits.
+Camera/file → adaptive threshold / line-peak board find → perspective warp → per-cell CNN digits → optional edit → Rust WASM `solve` → show solution (clues vs filled).
 
 ## Deploy
 

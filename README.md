@@ -1,13 +1,12 @@
 # sudoku-solver
 
-Rust Sudoku solver with **camera / photo scan** on [GitHub Pages](https://sn99.github.io/sudoku-solver/), and **native OCR** via [rusty-tesseract](https://github.com/thomasgruebl/rusty-tesseract).
+Rust Sudoku solver with **camera / photo scan** on [GitHub Pages](https://sn99.github.io/sudoku-solver/).
 
 [![CI](https://github.com/sn99/sudoku-solver/actions/workflows/ci.yml/badge.svg)](https://github.com/sn99/sudoku-solver/actions/workflows/ci.yml)
 
 ## Features
 
-- **Web (GitHub Pages):** open the rear camera or upload a photo, detect the board, classify digits with a **pretrained CNN** (no training in this repo), edit low-confidence cells, solve with **Rust compiled to WASM**
-- **CLI:** type a grid on stdin, or pass an image path to OCR with **rusty-tesseract** (system Tesseract required)
+- **Web (GitHub Pages):** open the rear camera or upload a photo, detect the board, classify digits with a **pretrained CNN** (no training in this repo), optionally edit cells, solve with **Rust compiled to WASM**
 
 ## How the web scanner works
 
@@ -35,31 +34,11 @@ cd web && python3 -m http.server 8080
 
 Camera requires a **secure context** (HTTPS or localhost). Digit CNN loads TensorFlow.js from jsDelivr (needs network on first load).
 
-## CLI
-
-```bash
-# Build
-cargo build -p sudoku-cli --release
-
-# Text grid (0 = empty), 9 lines
-cargo run -p sudoku-cli --release
-```
-
-OCR from image (install [Tesseract](https://github.com/tesseract-ocr/tesseract) first):
-
-```bash
-cargo run -p sudoku-cli --release -- path/to/puzzle.png
-```
-
-`*` marks lower-confidence OCR digits; `?` marks rejected/empty uncertain cells.
-
 ## Workspace layout
 
 | Path | Description |
 | --- | --- |
 | `crates/sudoku-core` | Grid + backtracking solver |
-| `crates/sudoku-ocr` | Native OCR (`rusty-tesseract`) |
-| `crates/sudoku-cli` | `sudoku-solver` binary |
 | `crates/sudoku-wasm` | Browser bindings |
 | `web/` | Static UI + vision scanner for Pages |
 | `web/models/digit-cnn/` | Pretrained digit classifier (CC0) |
