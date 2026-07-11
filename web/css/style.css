@@ -153,8 +153,14 @@ video, #preview-img {
   margin-top: 0.75rem;
 }
 
-.capture.camera-live .capture-actions {
-  grid-template-columns: 1fr 1fr;
+@media (min-width: 400px) {
+  .capture-actions {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+
+.capture.camera-live #btn-snap {
+  box-shadow: 0 4px 14px rgba(91, 157, 255, 0.35);
 }
 
 /* ----- board result bar ----- */

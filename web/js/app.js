@@ -59,9 +59,8 @@ function stopCamera() {
     stream = null;
   }
   video.srcObject = null;
-  btnSnap.classList.add("hidden");
   btnSnap.disabled = true;
-  btnCamera.classList.remove("hidden");
+  btnCamera.disabled = false;
   captureSection.classList.remove("camera-live");
 }
 
@@ -255,6 +254,9 @@ function showCaptureView() {
   video.classList.remove("hidden");
   if (scanOverlay) scanOverlay.classList.remove("hidden");
   if (methodEl) methodEl.textContent = "";
+  btnSnap.disabled = true;
+  btnCamera.disabled = false;
+  btnCamera.textContent = "Open camera";
   setSolveStatus("");
   setStatus("");
   lastPreviewUrl = "";
@@ -386,6 +388,8 @@ boardEl.addEventListener("keydown", (e) => {
 
 btnCamera.addEventListener("click", async () => {
   try {
+    btnCamera.disabled = true;
+    setStatus("Starting camera…");
     previewImg.classList.add("hidden");
     video.classList.remove("hidden");
     if (scanOverlay) scanOverlay.classList.add("hidden");
@@ -401,17 +405,22 @@ btnCamera.addEventListener("click", async () => {
     video.srcObject = stream;
     await video.play();
     captureSection.classList.add("camera-live");
-    btnSnap.classList.remove("hidden");
     btnSnap.disabled = false;
-    btnCamera.classList.add("hidden");
-    setStatus("Frame the puzzle, then Capture.");
+    btnCamera.disabled = false;
+    btnCamera.textContent = "Switch camera";
+    setStatus("Frame the puzzle, then tap Capture.");
   } catch (e) {
+    btnCamera.disabled = false;
+    btnSnap.disabled = true;
     setStatus(`Camera error: ${e.message}. Use Upload.`, "error");
   }
 });
 
 btnSnap.addEventListener("click", async () => {
-  if (!video.srcObject) return;
+  if (!video.srcObject) {
+    setStatus("Open the camera first, then Capture — or use Upload.", "error");
+    return;
+  }
   await processSource(video);
 });
 
