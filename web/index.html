@@ -3,43 +3,68 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
-  <meta name="theme-color" content="#0f172a" />
-  <title>Sudoku Solver — Scan &amp; Solve</title>
+  <meta name="theme-color" content="#0a0f1a" />
+  <meta name="description" content="Scan a Sudoku photo, fix any misreads, solve in the browser (Rust WASM)." />
+  <title>Sudoku Scan &amp; Solve</title>
   <link rel="stylesheet" href="css/style.css" />
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
 </head>
 <body>
   <main class="app">
-    <header>
-      <h1>Sudoku Solver</h1>
-      <p class="tagline">Point your camera or upload a photo, fix any misreads with the pad, then solve in Rust (WASM).</p>
+    <header class="hero">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">▣</span>
+        <div>
+          <h1>Sudoku Scanner</h1>
+          <p class="tagline">Photo → digits → solve. All on-device.</p>
+        </div>
+      </div>
     </header>
 
-    <section class="capture" id="capture-section">
+    <section class="card capture" id="capture-section">
       <div class="video-wrap" id="video-wrap">
         <video id="video" playsinline autoplay muted></video>
-        <img id="preview-img" class="hidden" alt="Captured puzzle preview" />
-        <div class="frame-guide" aria-hidden="true"></div>
-        <canvas id="snap-canvas" class="hidden"></canvas>
-        <canvas id="debug-canvas" class="hidden"></canvas>
+        <img id="preview-img" class="hidden" alt="Captured puzzle" />
+        <div class="frame-guide" aria-hidden="true">
+          <span class="corner tl"></span>
+          <span class="corner tr"></span>
+          <span class="corner bl"></span>
+          <span class="corner br"></span>
+        </div>
+        <div class="scan-overlay" id="scan-overlay">
+          <p>Open the camera or upload a clear photo of the full 9×9 grid.</p>
+        </div>
       </div>
+
       <div class="actions actions-row">
-        <button type="button" id="btn-camera" class="btn primary">Open camera</button>
-        <button type="button" id="btn-snap" class="btn primary" disabled>Capture</button>
+        <button type="button" id="btn-camera" class="btn primary">
+          <span class="btn-ico" aria-hidden="true">📷</span> Camera
+        </button>
+        <button type="button" id="btn-snap" class="btn primary" disabled>
+          <span class="btn-ico" aria-hidden="true">⌁</span> Capture
+        </button>
         <label class="btn secondary file-label">
-          Upload photo
+          <span class="btn-ico" aria-hidden="true">🖼</span> Upload
           <input type="file" id="file-input" accept="image/*" capture="environment" hidden />
         </label>
-        <button type="button" id="btn-manual" class="btn secondary">Enter manually</button>
+        <button type="button" id="btn-manual" class="btn ghost">Manual</button>
       </div>
       <p id="status" class="status" role="status"></p>
+      <p id="scan-method" class="meta" aria-live="polite"></p>
     </section>
 
-    <section class="board-section hidden" id="board-section">
-      <p class="hint">
-        Tap a cell, then use the pad or keys <kbd>1</kbd>–<kbd>9</kbd> / <kbd>⌫</kbd>.
-        <span class="low-conf-swatch"></span> low OCR confidence ·
-        <span class="conflict-swatch"></span> conflict
-      </p>
+    <section class="card board-section hidden" id="board-section">
+      <div class="section-head">
+        <h2>Grid</h2>
+        <p class="hint">
+          Tap a cell · keys <kbd>1</kbd>–<kbd>9</kbd> / <kbd>⌫</kbd>
+          <span class="swatch-row">
+            <span class="low-conf-swatch"></span> low confidence
+            <span class="conflict-swatch"></span> conflict
+          </span>
+        </p>
+      </div>
+
       <div class="board-wrap">
         <div id="board" class="board" role="grid" aria-label="Sudoku grid" tabindex="0"></div>
       </div>
@@ -59,22 +84,22 @@
 
       <div class="actions actions-row">
         <button type="button" id="btn-solve" class="btn primary">Solve</button>
-        <button type="button" id="btn-clear" class="btn secondary">Clear board</button>
-        <button type="button" id="btn-rescan" class="btn secondary">New scan</button>
+        <button type="button" id="btn-clear" class="btn secondary">Clear</button>
+        <button type="button" id="btn-rescan" class="btn ghost">New scan</button>
       </div>
       <p id="solve-status" class="status" role="status"></p>
     </section>
 
     <footer>
       <p>
-        Native CLI OCR: <a href="https://github.com/thomasgruebl/rusty-tesseract">rusty-tesseract</a>.
-        Browser OCR: improved grid detection + Tesseract.js.
-        <a href="https://github.com/sn99/sudoku-solver">Source</a>
+        Vision pipeline adapted from
+        <a href="https://github.com/atomic14/ar-browser-sudoku" rel="noopener">atomic14/ar-browser-sudoku</a>
+        (CC0) · pretrained digit CNN · solver in Rust/WASM ·
+        <a href="https://github.com/sn99/sudoku-solver">source</a>
       </p>
     </footer>
   </main>
 
-  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
-  <script type="module" src="js/app.js?v=crop9"></script>
+  <script type="module" src="js/app.js"></script>
 </body>
 </html>

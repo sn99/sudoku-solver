@@ -1,0 +1,3 @@
+Digit classification model from atomic14/ar-browser-sudoku (CC0 1.0).
+https://github.com/atomic14/ar-browser-sudoku
+No training was performed for this project — weights are reused as-is.

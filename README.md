@@ -6,9 +6,19 @@ Rust Sudoku solver with **camera / photo scan** on [GitHub Pages](https://sn99.g
 
 ## Features
 
-- **Web (GitHub Pages):** open the rear camera or upload a photo, OCR digits (Tesseract.js), edit low-confidence cells, solve with **Rust compiled to WASM**
+- **Web (GitHub Pages):** open the rear camera or upload a photo, detect the board, classify digits with a **pretrained CNN** (no training in this repo), edit low-confidence cells, solve with **Rust compiled to WASM**
 - **CLI:** type a grid on stdin, or pass an image path to OCR with **rusty-tesseract** (system Tesseract required)
-- **Grid detection:** projection-peak 9×9 localization (phone photos of apps), adaptive threshold + contour/warp fallbacks inspired by OpenCV solvers (SolveSudoku, SnapSudoku, sudoku-extraction), then per-cell binarization + multi-PSM Tesseract
+
+## How the web scanner works
+
+The browser pipeline is adapted from [atomic14/ar-browser-sudoku](https://github.com/atomic14/ar-browser-sudoku) (CC0):
+
+1. Adaptive threshold + largest connected component to find the board
+2. Corner points → perspective warp to a square grid
+3. Per-cell ink blobs → **pretrained TensorFlow.js digit model** (`web/models/digit-cnn/`)
+4. Fallback **line-peak** crop for phone screenshots / flat app UIs
+
+No new model training is required; weights are reused as-is.
 
 ## Web app
 
@@ -23,7 +33,7 @@ cd web && python3 -m http.server 8080
 # open http://127.0.0.1:8080
 ```
 
-Camera requires a **secure context** (HTTPS or localhost).
+Camera requires a **secure context** (HTTPS or localhost). Digit CNN loads TensorFlow.js from jsDelivr (needs network on first load).
 
 ## CLI
 
@@ -33,20 +43,6 @@ cargo build -p sudoku-cli --release
 
 # Text grid (0 = empty), 9 lines
 cargo run -p sudoku-cli --release
-```
-
-Example input:
-
-```
-0 0 8 0 0 0 9 0 0
-3 5 0 0 0 0 0 8 6
-0 7 0 9 0 6 0 3 0
-8 0 2 0 9 0 6 0 1
-0 0 0 7 0 8 0 0 0
-7 0 5 0 2 0 4 0 8
-0 2 0 1 0 3 0 6 0
-9 6 0 0 0 0 0 5 2
-0 0 3 0 0 0 7 0 0
 ```
 
 OCR from image (install [Tesseract](https://github.com/tesseract-ocr/tesseract) first):
@@ -65,8 +61,9 @@ cargo run -p sudoku-cli --release -- path/to/puzzle.png
 | `crates/sudoku-ocr` | Native OCR (`rusty-tesseract`) |
 | `crates/sudoku-cli` | `sudoku-solver` binary |
 | `crates/sudoku-wasm` | Browser bindings |
-| `web/` | Static UI for Pages |
+| `web/` | Static UI + vision scanner for Pages |
+| `web/models/digit-cnn/` | Pretrained digit classifier (CC0) |
 
 ## License
 
-MIT
+MIT (application). Digit model and vision ideas from atomic14/ar-browser-sudoku are CC0 — see `web/models/digit-cnn/NOTICE.txt`.
