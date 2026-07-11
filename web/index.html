@@ -21,6 +21,7 @@
       </div>
     </header>
 
+    <!-- Capture: only while scanning / starting -->
     <section class="card capture" id="capture-section">
       <div class="video-wrap" id="video-wrap">
         <video id="video" playsinline autoplay muted></video>
@@ -32,69 +33,79 @@
           <span class="corner br"></span>
         </div>
         <div class="scan-overlay" id="scan-overlay">
-          <p>Open the camera or upload a clear photo of the full 9×9 grid.</p>
+          <p>Camera or upload a clear full-grid photo</p>
         </div>
       </div>
 
-      <div class="actions actions-row">
-        <button type="button" id="btn-camera" class="btn primary">
-          <span class="btn-ico" aria-hidden="true">📷</span> Camera
-        </button>
-        <button type="button" id="btn-snap" class="btn primary" disabled>
-          <span class="btn-ico" aria-hidden="true">⌁</span> Capture
-        </button>
+      <div class="actions capture-actions" id="capture-actions">
+        <button type="button" id="btn-camera" class="btn primary">Camera</button>
+        <button type="button" id="btn-snap" class="btn primary hidden" disabled>Capture</button>
         <label class="btn secondary file-label">
-          <span class="btn-ico" aria-hidden="true">🖼</span> Upload
+          Upload
           <input type="file" id="file-input" accept="image/*" capture="environment" hidden />
         </label>
-        <button type="button" id="btn-manual" class="btn ghost">Manual</button>
+        <button type="button" id="btn-manual" class="btn ghost">Type grid</button>
       </div>
       <p id="status" class="status" role="status"></p>
       <p id="scan-method" class="meta" aria-live="polite"></p>
     </section>
 
+    <!-- Board: after scan / manual -->
     <section class="card board-section hidden" id="board-section">
-      <div class="section-head">
-        <h2>Grid</h2>
-        <p class="hint">
-          Tap a cell · keys <kbd>1</kbd>–<kbd>9</kbd> / <kbd>⌫</kbd>
-          <span class="swatch-row">
-            <span class="low-conf-swatch"></span> low confidence
-            <span class="conflict-swatch"></span> conflict
-          </span>
-        </p>
+      <div class="result-bar" id="result-bar">
+        <div class="thumb-wrap hidden" id="thumb-wrap">
+          <img id="thumb-img" alt="" />
+        </div>
+        <div class="result-meta">
+          <h2 id="board-title">Grid</h2>
+          <p id="result-summary" class="hint"></p>
+        </div>
       </div>
 
       <div class="board-wrap">
         <div id="board" class="board" role="grid" aria-label="Sudoku grid" tabindex="0"></div>
       </div>
 
-      <div class="numpad" id="numpad" role="group" aria-label="Digit pad">
-        <button type="button" class="pad-key" data-digit="1">1</button>
-        <button type="button" class="pad-key" data-digit="2">2</button>
-        <button type="button" class="pad-key" data-digit="3">3</button>
-        <button type="button" class="pad-key" data-digit="4">4</button>
-        <button type="button" class="pad-key" data-digit="5">5</button>
-        <button type="button" class="pad-key" data-digit="6">6</button>
-        <button type="button" class="pad-key" data-digit="7">7</button>
-        <button type="button" class="pad-key" data-digit="8">8</button>
-        <button type="button" class="pad-key" data-digit="9">9</button>
-        <button type="button" class="pad-key pad-wide" data-digit="0" id="btn-erase">Erase</button>
+      <!-- Edit panel: only when user opts in -->
+      <div class="edit-panel hidden" id="edit-panel">
+        <div class="edit-panel-head">
+          <p class="hint edit-hint">
+            Tap a cell, then a digit. Keys <kbd>1</kbd>–<kbd>9</kbd> / <kbd>⌫</kbd> also work.
+            <span class="swatch-row">
+              <span class="low-conf-swatch"></span> low confidence
+              <span class="conflict-swatch"></span> conflict
+            </span>
+          </p>
+          <button type="button" id="btn-done-edit" class="btn secondary btn-sm">Done</button>
+        </div>
+        <div class="numpad" id="numpad" role="group" aria-label="Digit pad">
+          <button type="button" class="pad-key" data-digit="1">1</button>
+          <button type="button" class="pad-key" data-digit="2">2</button>
+          <button type="button" class="pad-key" data-digit="3">3</button>
+          <button type="button" class="pad-key" data-digit="4">4</button>
+          <button type="button" class="pad-key" data-digit="5">5</button>
+          <button type="button" class="pad-key" data-digit="6">6</button>
+          <button type="button" class="pad-key" data-digit="7">7</button>
+          <button type="button" class="pad-key" data-digit="8">8</button>
+          <button type="button" class="pad-key" data-digit="9">9</button>
+          <button type="button" class="pad-key pad-wide" data-digit="0" id="btn-erase">Erase</button>
+        </div>
+        <button type="button" id="btn-clear" class="btn ghost btn-sm clear-btn">Clear all cells</button>
       </div>
 
-      <div class="actions actions-row">
+      <div class="actions board-actions" id="board-actions">
         <button type="button" id="btn-solve" class="btn primary">Solve</button>
-        <button type="button" id="btn-clear" class="btn secondary">Clear</button>
-        <button type="button" id="btn-rescan" class="btn ghost">New scan</button>
+        <button type="button" id="btn-edit" class="btn secondary">Edit cells</button>
+        <button type="button" id="btn-rescan" class="btn ghost">Rescan</button>
       </div>
       <p id="solve-status" class="status" role="status"></p>
     </section>
 
     <footer>
       <p>
-        Vision pipeline adapted from
+        Vision from
         <a href="https://github.com/atomic14/ar-browser-sudoku" rel="noopener">atomic14/ar-browser-sudoku</a>
-        (CC0) · pretrained digit CNN · solver in Rust/WASM ·
+        (CC0) · Rust/WASM solver ·
         <a href="https://github.com/sn99/sudoku-solver">source</a>
       </p>
     </footer>

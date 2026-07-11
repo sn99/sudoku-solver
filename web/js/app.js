@@ -1,6 +1,6 @@
 /**
  * Sudoku Solver web UI — camera/upload + vision scan + WASM solve.
- * Digit scan: atomic14-style CV + pretrained CNN (see vision.js).
+ * Edit pad is opt-in; rescan returns to a clean capture screen.
  */
 
 import { analyzeSudoku, warmVision } from "./vision.js";
@@ -16,13 +16,24 @@ const boardSection = document.getElementById("board-section");
 const captureSection = document.getElementById("capture-section");
 const numpad = document.getElementById("numpad");
 const methodEl = document.getElementById("scan-method");
+const scanOverlay = document.getElementById("scan-overlay");
+const editPanel = document.getElementById("edit-panel");
+const btnEdit = document.getElementById("btn-edit");
+const btnSnap = document.getElementById("btn-snap");
+const btnCamera = document.getElementById("btn-camera");
+const resultSummary = document.getElementById("result-summary");
+const boardTitle = document.getElementById("board-title");
+const thumbWrap = document.getElementById("thumb-wrap");
+const thumbImg = document.getElementById("thumb-img");
 
 let stream = null;
 let wasm = null;
 let cells = emptyCells();
 let solutionMode = false;
+let editMode = false;
 let activeIndex = 0;
 let scanning = false;
+let lastPreviewUrl = "";
 
 function emptyCells() {
   return Array.from({ length: 81 }, () => ({ digit: 0, confidence: -1 }));
@@ -42,6 +53,18 @@ function yieldToUi() {
   return new Promise((r) => setTimeout(r, 0));
 }
 
+function stopCamera() {
+  if (stream) {
+    stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+  }
+  video.srcObject = null;
+  btnSnap.classList.add("hidden");
+  btnSnap.disabled = true;
+  btnCamera.classList.remove("hidden");
+  captureSection.classList.remove("camera-live");
+}
+
 async function loadWasm() {
   const base = new URL(".", import.meta.url);
   const candidates = [
@@ -59,7 +82,7 @@ async function loadWasm() {
       console.warn("WASM load failed for", url, e);
     }
   }
-  setStatus("Solver WASM missing — refresh or use Enter manually.", "error");
+  setStatus("Solver WASM missing — refresh or use Type grid.", "error");
 }
 
 function conflictSet() {
@@ -137,6 +160,32 @@ function resolveConflicts(list) {
   return out;
 }
 
+function setEditMode(on, { focus = true } = {}) {
+  editMode = !!on;
+  if (editMode) {
+    // Drop out of solution view so user can fix clues.
+    if (solutionMode) {
+      solutionMode = false;
+      // Restore only givens if we were in solution mode — keep current digits as editable.
+    }
+    editPanel.classList.remove("hidden");
+    btnEdit.textContent = "Editing…";
+    btnEdit.classList.add("active-edit");
+    boardEl.classList.add("editing");
+    boardEl.classList.remove("view-only");
+    if (focus) {
+      boardEl.focus({ preventScroll: true });
+    }
+  } else {
+    editPanel.classList.add("hidden");
+    btnEdit.textContent = "Edit cells";
+    btnEdit.classList.remove("active-edit");
+    boardEl.classList.remove("editing");
+    boardEl.classList.add("view-only");
+  }
+  renderBoard();
+}
+
 function renderBoard() {
   const conflicts = conflictSet();
   boardEl.innerHTML = "";
@@ -147,22 +196,18 @@ function renderBoard() {
     btn.className = "cell";
     btn.dataset.index = String(i);
     btn.setAttribute("role", "gridcell");
+    btn.tabIndex = editMode ? 0 : -1;
     if (digit > 0) btn.textContent = String(digit);
-    if (
-      !solutionMode &&
-      confidence >= 0 &&
-      confidence < LOW_CONF_UI &&
-      (digit > 0 || confidence >= 0)
-    ) {
-      if (digit > 0 && confidence < LOW_CONF_UI) btn.classList.add("low-conf");
+    if (!solutionMode && digit > 0 && confidence >= 0 && confidence < LOW_CONF_UI) {
+      btn.classList.add("low-conf");
     }
     if (conflicts.has(i)) btn.classList.add("conflict");
     if (solutionMode && digit > 0 && !cells[i]._wasGiven) btn.classList.add("solution");
     if (solutionMode && cells[i]._wasGiven) btn.classList.add("given");
-    if (activeIndex === i && !solutionMode) btn.classList.add("active");
+    if (editMode && activeIndex === i && !solutionMode) btn.classList.add("active");
     btn.addEventListener("pointerdown", (e) => {
       e.preventDefault();
-      if (solutionMode) return;
+      if (!editMode || solutionMode) return;
       activeIndex = i;
       renderBoard();
       boardEl.focus({ preventScroll: true });
@@ -172,8 +217,9 @@ function renderBoard() {
 }
 
 function setDigitAtActive(digit) {
+  if (!editMode) return;
   if (solutionMode) {
-    setSolveStatus("Clear or New scan to edit.", "error");
+    setSolveStatus("Turn on Edit cells to change the board.", "error");
     return;
   }
   if (activeIndex == null || activeIndex < 0 || activeIndex > 80) activeIndex = 0;
@@ -183,12 +229,35 @@ function setDigitAtActive(digit) {
   renderBoard();
 }
 
-function showBoard() {
+function showBoardView({ summary = "", title = "Grid", openEdit = false } = {}) {
+  captureSection.classList.add("hidden");
   boardSection.classList.remove("hidden");
-  captureSection.classList.add("compact");
+  boardTitle.textContent = title;
+  resultSummary.textContent = summary;
+  if (lastPreviewUrl) {
+    thumbImg.src = lastPreviewUrl;
+    thumbWrap.classList.remove("hidden");
+  } else {
+    thumbWrap.classList.add("hidden");
+  }
+  setEditMode(openEdit, { focus: openEdit });
+  if (!openEdit) renderBoard();
+}
+
+function showCaptureView() {
+  setEditMode(false);
   solutionMode = false;
-  renderBoard();
-  boardEl.focus({ preventScroll: true });
+  boardSection.classList.add("hidden");
+  captureSection.classList.remove("hidden");
+  captureSection.classList.remove("camera-live");
+  previewImg.classList.add("hidden");
+  previewImg.removeAttribute("src");
+  video.classList.remove("hidden");
+  if (scanOverlay) scanOverlay.classList.remove("hidden");
+  if (methodEl) methodEl.textContent = "";
+  setSolveStatus("");
+  setStatus("");
+  lastPreviewUrl = "";
 }
 
 function digitsArray() {
@@ -202,61 +271,81 @@ function sourceSize(source) {
   };
 }
 
+function setPreviewFromSource(source) {
+  if (source === video) {
+    const { w, h } = sourceSize(video);
+    const t = document.createElement("canvas");
+    t.width = w;
+    t.height = h;
+    t.getContext("2d").drawImage(video, 0, 0);
+    lastPreviewUrl = t.toDataURL("image/jpeg", 0.8);
+    previewImg.src = lastPreviewUrl;
+  } else if (source?.src) {
+    lastPreviewUrl = source.src;
+    previewImg.src = source.src;
+  } else {
+    lastPreviewUrl = "";
+  }
+  if (lastPreviewUrl) {
+    previewImg.classList.remove("hidden");
+    video.classList.add("hidden");
+  }
+}
+
 async function processSource(source) {
   if (scanning) {
     setStatus("Already scanning — please wait.", "error");
     return;
   }
   scanning = true;
-  const snapBtn = document.getElementById("btn-snap");
-  if (snapBtn) snapBtn.disabled = true;
+  btnSnap.disabled = true;
   try {
     setStatus("Preparing…");
     await yieldToUi();
-
-    if (source === video) {
-      const { w, h } = sourceSize(video);
-      const t = document.createElement("canvas");
-      t.width = w;
-      t.height = h;
-      t.getContext("2d").drawImage(video, 0, 0);
-      previewImg.src = t.toDataURL("image/jpeg", 0.85);
-      previewImg.classList.remove("hidden");
-      video.classList.add("hidden");
-    } else if (source?.src) {
-      previewImg.src = source.src;
-      previewImg.classList.remove("hidden");
-      video.classList.add("hidden");
-    }
+    setPreviewFromSource(source);
 
     const t0 = performance.now();
     const { cells: read, method, boxCount } = await analyzeSudoku(source, (msg) => {
       setStatus(msg);
     });
 
+    // Stop camera after a successful capture so Rescan is clean.
+    stopCamera();
+
     cells = read.map((c) => ({ ...c, _wasGiven: c.digit > 0 }));
     activeIndex = 0;
+    solutionMode = false;
     const filled = cells.filter((c) => c.digit > 0).length;
     const low = cells.filter(
       (c) => c.digit > 0 && c.confidence >= 0 && c.confidence < LOW_CONF_UI
     ).length;
     const ms = Math.round(performance.now() - t0);
     if (methodEl) {
-      methodEl.textContent = `Detected via ${method} · ${boxCount} ink cells · ${ms}ms`;
+      methodEl.textContent = `Detected via ${method} · ${boxCount} cells · ${ms}ms`;
     }
-    setStatus(
+
+    const summary =
       filled >= 28
-        ? `Read ${filled} digits${low ? ` (${low} low-confidence)` : ""}. Check the grid, then Solve.`
-        : `Only ${filled} digits found — fill missing cells from the photo, then Solve.`,
+        ? `${filled} digits read${low ? ` · ${low} low-confidence` : ""}. Solve, or Edit if something looks wrong.`
+        : `Only ${filled} digits found. Tap Edit cells to fill missing ones, then Solve.`;
+
+    setStatus(
+      filled >= 22 ? `Scan complete — ${filled} digits.` : `Weak scan — ${filled} digits.`,
       filled >= 22 ? "ok" : "error"
     );
-    showBoard();
+
+    showBoardView({
+      summary,
+      title: "Scanned grid",
+      // Auto-open editor only when the scan is clearly incomplete.
+      openEdit: filled < 22,
+    });
   } catch (e) {
     console.error(e);
-    setStatus(`Scan failed: ${e.message || e}. Try another photo or Enter manually.`, "error");
+    setStatus(`Scan failed: ${e.message || e}. Try another photo or Type grid.`, "error");
   } finally {
     scanning = false;
-    if (snapBtn && video.srcObject) snapBtn.disabled = false;
+    if (video.srcObject) btnSnap.disabled = false;
   }
 }
 
@@ -270,7 +359,7 @@ numpad.addEventListener("pointerdown", (e) => {
 });
 
 boardEl.addEventListener("keydown", (e) => {
-  if (solutionMode) return;
+  if (!editMode || solutionMode) return;
   if (e.key >= "1" && e.key <= "9") {
     e.preventDefault();
     setDigitAtActive(+e.key);
@@ -295,9 +384,7 @@ boardEl.addEventListener("keydown", (e) => {
   renderBoard();
 });
 
-const scanOverlay = document.getElementById("scan-overlay");
-
-document.getElementById("btn-camera").addEventListener("click", async () => {
+btnCamera.addEventListener("click", async () => {
   try {
     previewImg.classList.add("hidden");
     video.classList.remove("hidden");
@@ -313,14 +400,17 @@ document.getElementById("btn-camera").addEventListener("click", async () => {
     });
     video.srcObject = stream;
     await video.play();
-    document.getElementById("btn-snap").disabled = false;
-    setStatus("Frame the puzzle, then tap Capture.");
+    captureSection.classList.add("camera-live");
+    btnSnap.classList.remove("hidden");
+    btnSnap.disabled = false;
+    btnCamera.classList.add("hidden");
+    setStatus("Frame the puzzle, then Capture.");
   } catch (e) {
-    setStatus(`Camera error: ${e.message}. Use Upload photo.`, "error");
+    setStatus(`Camera error: ${e.message}. Use Upload.`, "error");
   }
 });
 
-document.getElementById("btn-snap").addEventListener("click", async () => {
+btnSnap.addEventListener("click", async () => {
   if (!video.srcObject) return;
   await processSource(video);
 });
@@ -331,9 +421,7 @@ document.getElementById("file-input").addEventListener("change", async (ev) => {
   const url = URL.createObjectURL(file);
   const img = new Image();
   img.onload = async () => {
-    previewImg.src = url;
-    previewImg.classList.remove("hidden");
-    video.classList.add("hidden");
+    if (scanOverlay) scanOverlay.classList.add("hidden");
     await processSource(img);
   };
   img.onerror = () => setStatus("Could not load image", "error");
@@ -342,11 +430,33 @@ document.getElementById("file-input").addEventListener("change", async (ev) => {
 });
 
 document.getElementById("btn-manual").addEventListener("click", () => {
+  stopCamera();
   cells = emptyCells();
   activeIndex = 0;
-  if (methodEl) methodEl.textContent = "Manual entry";
-  setStatus("Tap cells and use the pad (or keys 1–9).");
-  showBoard();
+  solutionMode = false;
+  lastPreviewUrl = "";
+  if (methodEl) methodEl.textContent = "";
+  setStatus("");
+  showBoardView({
+    summary: "Empty grid — fill clues, then Solve.",
+    title: "Manual grid",
+    openEdit: true,
+  });
+});
+
+btnEdit.addEventListener("click", () => {
+  if (editMode) {
+    setEditMode(false);
+    setSolveStatus("");
+  } else {
+    setEditMode(true);
+    setSolveStatus("Editing — tap a cell, then a digit.");
+  }
+});
+
+document.getElementById("btn-done-edit").addEventListener("click", () => {
+  setEditMode(false);
+  setSolveStatus("");
 });
 
 document.getElementById("btn-solve").addEventListener("click", () => {
@@ -354,16 +464,20 @@ document.getElementById("btn-solve").addEventListener("click", () => {
     setSolveStatus("WASM solver not loaded — refresh the page.", "error");
     return;
   }
+  // Leave edit mode for a clean result view.
+  setEditMode(false);
   cells = resolveConflicts(cells.map((c) => ({ ...c })));
   renderBoard();
   if (conflictSet().size) {
-    setSolveStatus("Fix conflicting digits (red) first.", "error");
+    setSolveStatus("Fix conflicting digits (red) first — open Edit cells.", "error");
+    setEditMode(true);
     return;
   }
   const clueCount = cells.filter((c) => c.digit > 0).length;
   const emptyCount = 81 - clueCount;
   if (clueCount < 17) {
-    setSolveStatus(`Need more clues (have ${clueCount}).`, "error");
+    setSolveStatus(`Need more clues (have ${clueCount}). Open Edit cells.`, "error");
+    setEditMode(true);
     return;
   }
   if (emptyCount > 45 || clueCount < 28) {
@@ -371,7 +485,7 @@ document.getElementById("btn-solve").addEventListener("click", () => {
       `Only ${clueCount} clues were read. Incomplete scans can produce a different valid puzzle.\n\nSolve with current clues anyway?`
     );
     if (!ok) {
-      setSolveStatus("Fill empty cells from the photo, then Solve.", "error");
+      setSolveStatus("Open Edit cells to add missing digits, then Solve.", "error");
       return;
     }
   }
@@ -391,29 +505,28 @@ document.getElementById("btn-solve").addEventListener("click", () => {
     }));
     solutionMode = true;
     renderBoard();
+    boardTitle.textContent = "Solution";
+    resultSummary.textContent = "Blue digits were filled by the solver. Rescan for a new puzzle.";
     setSolveStatus("Solved.", "ok");
   } catch (e) {
-    setSolveStatus(`${e.message || e} — fix clues and try again.`, "error");
+    setSolveStatus(`${e.message || e} — open Edit cells and fix clues.`, "error");
   }
 });
 
 document.getElementById("btn-clear").addEventListener("click", () => {
+  if (!editMode) return;
   cells = emptyCells();
   solutionMode = false;
   activeIndex = 0;
   renderBoard();
-  setSolveStatus("");
+  setSolveStatus("Board cleared.");
 });
 
 document.getElementById("btn-rescan").addEventListener("click", () => {
-  boardSection.classList.add("hidden");
-  captureSection.classList.remove("compact");
-  setSolveStatus("");
-  setStatus("");
-  if (methodEl) methodEl.textContent = "";
-  previewImg.classList.add("hidden");
-  video.classList.remove("hidden");
-  if (scanOverlay && !video.srcObject) scanOverlay.classList.remove("hidden");
+  stopCamera();
+  cells = emptyCells();
+  showCaptureView();
+  setStatus("Take a new photo or upload another image.");
 });
 
 loadWasm();
